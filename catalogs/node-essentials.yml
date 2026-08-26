@@ -1,0 +1,8 @@
+- name: node
+  kind: formula
+  title: Node.js
+  category: Languages
+- name: pnpm
+  kind: formula
+  title: pnpm
+  category: Languages

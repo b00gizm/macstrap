@@ -1,0 +1,4 @@
+- name: rustup
+  kind: formula
+  title: rustup
+  category: Languages

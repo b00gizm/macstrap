@@ -10,29 +10,29 @@
   kind: formula
   title: ripgrep
   category: CLI
+- name: fd
+  kind: formula
+  title: fd
+  category: CLI
 - name: fzf
   kind: formula
   title: fzf
+  category: CLI
+- name: jq
+  kind: formula
+  title: jq
+  category: CLI
+- name: bat
+  kind: formula
+  title: bat
   category: CLI
 - name: neovim
   kind: formula
   title: Neovim
   category: CLI
-- name: node
-  kind: formula
-  title: Node.js
-  category: Languages
-- name: rustup
-  kind: formula
-  title: rustup
-  category: Languages
 - name: visual-studio-code
   kind: cask
   title: Visual Studio Code
-  category: Apps
-- name: iterm2
-  kind: cask
-  title: iTerm2
   category: Apps
 - name: ghostty
   kind: cask

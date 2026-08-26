@@ -10,6 +10,77 @@ pub enum Kind {
     Mas,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CatalogId {
+    CliEssentials,
+    NodeEssentials,
+    NodeFull,
+    PythonEssentials,
+    PythonFull,
+    RustEssentials,
+    RustFull,
+}
+
+pub struct CatalogFile {
+    pub id: CatalogId,
+    pub title: &'static str,
+    pub required: bool,
+    yaml: &'static str,
+}
+
+const FILES: &[CatalogFile] = &[
+    CatalogFile {
+        id: CatalogId::CliEssentials,
+        title: "CLI essentials",
+        required: true,
+        yaml: include_str!("../catalogs/cli-essentials.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::NodeEssentials,
+        title: "Node essentials",
+        required: false,
+        yaml: include_str!("../catalogs/node-essentials.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::NodeFull,
+        title: "Node full",
+        required: false,
+        yaml: include_str!("../catalogs/node-full.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::PythonEssentials,
+        title: "Python essentials",
+        required: false,
+        yaml: include_str!("../catalogs/python-essentials.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::PythonFull,
+        title: "Python full",
+        required: false,
+        yaml: include_str!("../catalogs/python-full.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::RustEssentials,
+        title: "Rust essentials",
+        required: false,
+        yaml: include_str!("../catalogs/rust-essentials.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::RustFull,
+        title: "Rust full",
+        required: false,
+        yaml: include_str!("../catalogs/rust-full.yml"),
+    },
+];
+
+pub fn files() -> &'static [CatalogFile] {
+    FILES
+}
+
+pub fn default_loaded() -> HashSet<CatalogId> {
+    FILES.iter().filter(|f| f.required).map(|f| f.id).collect()
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PkgId(String);
 
@@ -63,15 +134,27 @@ impl From<CatalogRow> for Package {
     }
 }
 
-const CATALOG_YAML: &str = include_str!("../catalog.yaml");
-
-pub fn load_embedded() -> Result<Catalog, String> {
-    load(CATALOG_YAML)
-}
-
 pub fn load(yaml: &str) -> Result<Catalog, String> {
     let rows: Vec<CatalogRow> = serde_yaml::from_str(yaml).map_err(|e| format!("catalog: {e}"))?;
     Ok(rows.into_iter().map(Package::from).collect())
+}
+
+pub fn compose(loaded: &HashSet<CatalogId>) -> Result<Catalog, String> {
+    let mut active = default_loaded();
+    active.extend(loaded.iter().copied());
+    let mut packages = Catalog::new();
+    let mut seen = HashSet::new();
+    for file in FILES {
+        if !active.contains(&file.id) {
+            continue;
+        }
+        for pkg in load(file.yaml)? {
+            if seen.insert(pkg.id.clone()) {
+                packages.push(pkg);
+            }
+        }
+    }
+    Ok(packages)
 }
 
 pub struct Merge {
@@ -127,19 +210,47 @@ mod tests {
         }
     }
 
+    fn names(catalog: &[Package]) -> HashSet<&str> {
+        catalog.iter().map(|p| p.name.as_str()).collect()
+    }
+
     #[test]
-    fn load_embedded_catalog() {
-        let catalog = load_embedded().unwrap();
-        assert!(
-            catalog
-                .iter()
-                .any(|p| p.name == "git" && p.kind == Kind::Formula)
+    fn compose_always_includes_cli_essentials() {
+        let catalog = compose(&HashSet::new()).unwrap();
+        let names = names(&catalog);
+        assert!(names.contains("git"));
+        assert!(names.contains("visual-studio-code"));
+        assert!(!names.contains("node"));
+        assert!(!names.contains("rustup"));
+        assert!(!names.contains("python@3.14"));
+    }
+
+    #[test]
+    fn compose_unions_and_dedups() {
+        let loaded = HashSet::from([CatalogId::NodeEssentials, CatalogId::NodeFull]);
+        let catalog = compose(&loaded).unwrap();
+        let names = names(&catalog);
+        assert!(names.contains("git"));
+        assert!(names.contains("node"));
+        assert!(names.contains("pnpm"));
+        assert!(names.contains("orbstack"));
+        assert_eq!(
+            catalog.iter().filter(|p| p.name == "node").count(),
+            1,
+            "node from essentials and full must collapse to one row"
         );
-        assert!(
-            catalog
-                .iter()
-                .any(|p| p.name == "visual-studio-code" && p.kind == Kind::Cask)
-        );
+    }
+
+    #[test]
+    fn each_catalog_file_parses() {
+        for file in FILES {
+            let rows = load(file.yaml).unwrap();
+            assert!(
+                !rows.is_empty(),
+                "{} must list at least one package",
+                file.title
+            );
+        }
     }
 
     #[test]
