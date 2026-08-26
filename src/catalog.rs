@@ -219,7 +219,7 @@ mod tests {
         let catalog = compose(&HashSet::new()).unwrap();
         let names = names(&catalog);
         assert!(names.contains("git"));
-        assert!(names.contains("visual-studio-code"));
+        assert!(names.contains("jq"));
         assert!(!names.contains("node"));
         assert!(!names.contains("rustup"));
         assert!(!names.contains("python@3.14"));
@@ -233,7 +233,7 @@ mod tests {
         assert!(names.contains("git"));
         assert!(names.contains("node"));
         assert!(names.contains("pnpm"));
-        assert!(names.contains("orbstack"));
+        assert!(names.contains("bun"));
         assert_eq!(
             catalog.iter().filter(|p| p.name == "node").count(),
             1,

@@ -667,6 +667,6 @@ mod tests {
         assert!(merged.selection[&PkgId::new(Kind::Formula, "git", None)]);
         assert!(merged.selection[&PkgId::new(Kind::Cask, "visual-studio-code", None)]);
         assert!(merged.selection[&PkgId::new(Kind::Mas, "Yoink", Some(457622435))]);
-        assert!(!merged.selection[&PkgId::new(Kind::Formula, "ripgrep", None)]);
+        assert!(!merged.selection[&PkgId::new(Kind::Formula, "fzf", None)]);
     }
 }

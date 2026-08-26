@@ -6,10 +6,6 @@
   kind: formula
   title: GitHub CLI
   category: CLI
-- name: ripgrep
-  kind: formula
-  title: ripgrep
-  category: CLI
 - name: fd
   kind: formula
   title: fd
@@ -22,19 +18,3 @@
   kind: formula
   title: jq
   category: CLI
-- name: bat
-  kind: formula
-  title: bat
-  category: CLI
-- name: neovim
-  kind: formula
-  title: Neovim
-  category: CLI
-- name: visual-studio-code
-  kind: cask
-  title: Visual Studio Code
-  category: Apps
-- name: ghostty
-  kind: cask
-  title: Ghostty
-  category: Apps

@@ -14,15 +14,3 @@
   kind: formula
   title: Bun
   category: Languages
-- name: redis
-  kind: formula
-  title: Redis
-  category: Services
-- name: postgresql@16
-  kind: formula
-  title: PostgreSQL 16
-  category: Services
-- name: orbstack
-  kind: cask
-  title: OrbStack
-  category: Apps
