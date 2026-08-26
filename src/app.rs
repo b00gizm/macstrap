@@ -55,6 +55,7 @@ pub struct CatalogList {
     pub facts: HashMap<catalog::PkgId, catalog::BrewFacts>,
     pub filter: String,
     pub filtering: bool,
+    pub show_all_installed: bool,
 }
 
 impl CatalogList {
@@ -87,6 +88,9 @@ impl CatalogList {
         if let Some(i) = self.current() {
             let id = &self.packages[i].id;
             let on = self.selection.get(id).copied().unwrap_or(false);
+            if on && catalog::is_protected(id) {
+                return;
+            }
             self.selection.insert(id.clone(), !on);
         }
     }
@@ -99,7 +103,9 @@ impl CatalogList {
 
     pub fn select_none(&mut self) {
         for i in self.visible() {
-            self.selection.insert(self.packages[i].id.clone(), false);
+            let id = &self.packages[i].id;
+            self.selection
+                .insert(id.clone(), catalog::is_protected(id));
         }
     }
 
@@ -115,15 +121,23 @@ impl CatalogList {
 
     pub fn reload(&mut self) {
         let catalog = catalog::compose(&self.loaded).expect("embedded catalogs parse");
-        let merged = catalog::merge(&catalog, &self.desired);
+        let universe = catalog::compose_all().expect("embedded catalogs parse");
+        let mut merged = catalog::merge(&catalog, &self.desired);
+        catalog::include_observed(
+            &mut merged,
+            &self.observed,
+            &universe,
+            self.show_all_installed,
+        );
         let old = std::mem::take(&mut self.selection);
         self.packages = merged.packages;
         self.selection = merged.selection;
-        for (id, on) in old {
-            if self.selection.contains_key(&id) {
-                self.selection.insert(id, on);
+        for (id, on) in &old {
+            if self.selection.contains_key(id) {
+                self.selection.insert(id.clone(), *on);
             }
         }
+        catalog::preselect_installed(&mut self.selection, &self.observed, Some(&old));
         catalog::apply_facts(&mut self.packages, &self.facts);
         let vis = self.visible().len();
         self.cursor = if vis == 0 {
@@ -131,6 +145,11 @@ impl CatalogList {
         } else {
             self.cursor.min(vis - 1)
         };
+    }
+
+    pub fn toggle_show_all_installed(&mut self) {
+        self.show_all_installed = !self.show_all_installed;
+        self.reload();
     }
 
     pub fn toggle_catalog(&mut self) {
@@ -223,6 +242,10 @@ impl CatalogList {
                 self.select_none();
                 PickAction::Continue
             }
+            KeyCode::Char('o') => {
+                self.toggle_show_all_installed();
+                PickAction::Continue
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_cursor(1);
                 PickAction::Continue
@@ -268,6 +291,9 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
     }
     let mut merged = catalog::merge(&catalog, &desired);
     let observed = host.installed()?;
+    let universe = catalog::compose_all().map_err(Error::Message)?;
+    catalog::include_observed(&mut merged, &observed, &universe, false);
+    catalog::preselect_installed(&mut merged.selection, &observed, None);
 
     if opts.yes {
         return apply(host, &merged.packages, &merged.selection, &observed);
@@ -278,13 +304,6 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         ));
     }
 
-    let all: HashSet<catalog::CatalogId> = catalog::files().iter().map(|f| f.id).collect();
-    let mut universe = catalog::compose(&all).map_err(Error::Message)?;
-    for pkg in desired.values() {
-        if !universe.iter().any(|p| p.id == pkg.id) {
-            universe.push(pkg.clone());
-        }
-    }
     let facts = host.brew_facts(&universe)?;
     catalog::apply_facts(&mut merged.packages, &facts);
 
@@ -299,6 +318,7 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         facts,
         filter: String::new(),
         filtering: false,
+        show_all_installed: false,
     };
     let confirmed = pick(&mut list)?;
     if !confirmed {
@@ -349,6 +369,17 @@ fn apply(
     println!("Apply");
     let mut failed = 0;
     let mut seen = observed.clone();
+    for pkg in catalog::pending_uninstall(packages, selection, &seen) {
+        let outcome = ensure::remove_package(host, pkg, &seen);
+        ensure::print_outcome(&pkg.name, outcome);
+        match outcome {
+            Outcome::Removed | Outcome::Satisfied => {
+                seen.remove(&pkg.id);
+            }
+            Outcome::Failed => failed += 1,
+            Outcome::Applied => {}
+        }
+    }
     let mas_id = catalog::PkgId::new(Kind::Formula, "mas", None);
     let needs_mas = catalog::pending(packages, selection, observed)
         .iter()
@@ -386,6 +417,7 @@ fn apply(
                 seen.insert(pkg.id.clone());
             }
             Outcome::Failed => failed += 1,
+            Outcome::Removed => {}
         }
     }
     if failed > 0 {
@@ -488,13 +520,17 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
         .collect();
     let title = if list.filtering {
         format!("Choose tools  /{}", list.filter)
+    } else if list.show_all_installed {
+        "Choose tools · all installed".into()
     } else {
-        "Choose tools".into()
+        "Choose tools · catalog".into()
     };
     let widget = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(widget, areas[0]);
     frame.render_widget(
-        Paragraph::new("space toggle  a all  n none  / filter  c catalogs  enter confirm  q abort"),
+        Paragraph::new(
+            "space toggle  a all  n none  o all installed  / filter  c catalogs  enter confirm  q abort",
+        ),
         areas[1],
     );
 }
@@ -532,8 +568,10 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
 }
 
 fn draw_confirm(frame: &mut ratatui::Frame, list: &CatalogList) {
-    let n = catalog::pending(&list.packages, &list.selection, &list.observed).len();
-    let text = format!("{n} package(s) to install\nenter apply   esc back");
+    let install = catalog::pending(&list.packages, &list.selection, &list.observed).len();
+    let uninstall =
+        catalog::pending_uninstall(&list.packages, &list.selection, &list.observed).len();
+    let text = format!("{install} to install, {uninstall} to uninstall\nenter apply   esc back");
     frame.render_widget(
         Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Apply")),
         frame.area(),
@@ -560,7 +598,7 @@ mod tests {
     }
 
     fn list() -> CatalogList {
-        let packages = vec![pkg("git"), pkg("ripgrep"), pkg("fzf")];
+        let packages = vec![pkg("ripgrep"), pkg("node"), pkg("bun")];
         let mut selection = Selection::new();
         selection.insert(packages[0].id.clone(), true);
         selection.insert(packages[1].id.clone(), false);
@@ -576,6 +614,7 @@ mod tests {
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
+            show_all_installed: false,
         }
     }
 
@@ -617,6 +656,7 @@ mod tests {
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
+            show_all_installed: false,
         }
     }
 
@@ -710,7 +750,86 @@ mod tests {
         l.filter = "rip".into();
         l.select_all();
         assert!(l.selection[&PkgId::new(Kind::Formula, "ripgrep", None)]);
-        assert!(!l.selection[&PkgId::new(Kind::Formula, "fzf", None)]);
+        assert!(!l.selection[&PkgId::new(Kind::Formula, "bun", None)]);
+    }
+
+    #[test]
+    fn apply_uninstalls_deselected_observed() {
+        let host = ensure::FakeHost::default();
+        let git = pkg("git");
+        let rg = pkg("ripgrep");
+        host.installed
+            .borrow_mut()
+            .insert(git.id.clone());
+        host.installed
+            .borrow_mut()
+            .insert(rg.id.clone());
+        let packages = vec![git.clone(), rg.clone()];
+        let mut selection = Selection::new();
+        selection.insert(git.id.clone(), false);
+        selection.insert(rg.id.clone(), true);
+        let observed = host.installed.borrow().clone();
+        apply(&host, &packages, &selection, &observed).unwrap();
+        assert!(host.uninstalls.borrow().is_empty());
+        assert!(host.installs.borrow().is_empty());
+    }
+
+    #[test]
+    fn apply_uninstalls_non_essential_only() {
+        let host = ensure::FakeHost::default();
+        let git = pkg("git");
+        let rg = pkg("ripgrep");
+        host.installed
+            .borrow_mut()
+            .insert(git.id.clone());
+        host.installed
+            .borrow_mut()
+            .insert(rg.id.clone());
+        let packages = vec![git, rg.clone()];
+        let mut selection = Selection::new();
+        selection.insert(packages[0].id.clone(), true);
+        selection.insert(rg.id.clone(), false);
+        let observed = host.installed.borrow().clone();
+        apply(&host, &packages, &selection, &observed).unwrap();
+        assert_eq!(*host.uninstalls.borrow(), vec![rg.id]);
+    }
+
+    #[test]
+    fn observed_optional_catalog_survives_reload() {
+        let mut l = live_list();
+        let node_id = PkgId::new(Kind::Formula, "node", None);
+        l.observed.insert(node_id.clone());
+        l.reload();
+        assert!(l.packages.iter().any(|p| p.name == "node"));
+        assert!(l.selection.contains_key(&node_id));
+    }
+
+    #[test]
+    fn toggle_show_all_installed_adds_unknown_formula() {
+        let mut l = live_list();
+        let wget = PkgId::new(Kind::Formula, "wget", None);
+        l.observed.insert(wget.clone());
+        assert!(!l.packages.iter().any(|p| p.name == "wget"));
+        l.toggle_show_all_installed();
+        assert!(l.show_all_installed);
+        assert!(l.packages.iter().any(|p| p.name == "wget"));
+        l.toggle_show_all_installed();
+        assert!(!l.show_all_installed);
+        assert!(!l.packages.iter().any(|p| p.name == "wget"));
+    }
+
+    #[test]
+    fn toggle_wont_uncheck_cli_essential() {
+        let mut l = live_list();
+        let git = PkgId::new(Kind::Formula, "git", None);
+        l.selection.insert(git.clone(), true);
+        l.cursor = l
+            .visible()
+            .into_iter()
+            .position(|i| l.packages[i].id == git)
+            .unwrap();
+        l.toggle();
+        assert!(l.selection[&git]);
     }
 
     #[test]

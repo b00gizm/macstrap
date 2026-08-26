@@ -14,6 +14,7 @@ use crate::catalog::{self, BrewFacts, Kind, Observed, Package, PkgId};
 pub enum Outcome {
     Satisfied,
     Applied,
+    Removed,
     Failed,
 }
 
@@ -22,6 +23,7 @@ impl Outcome {
         match self {
             Self::Satisfied => "satisfied",
             Self::Applied => "applied",
+            Self::Removed => "removed",
             Self::Failed => "failed",
         }
     }
@@ -59,6 +61,7 @@ pub trait Host {
     fn install_omz(&self) -> Result<(), Error>;
     fn installed(&self) -> Result<Observed, Error>;
     fn install(&self, pkg: &Package) -> Result<(), Error>;
+    fn uninstall(&self, pkg: &Package) -> Result<(), Error>;
     fn brew_facts(&self, packages: &[Package]) -> Result<HashMap<PkgId, BrewFacts>, Error>;
 }
 
@@ -112,6 +115,16 @@ pub fn ensure_package(host: &impl Host, pkg: &Package, observed: &Observed) -> O
     }
     match host.install(pkg) {
         Ok(()) => Outcome::Applied,
+        Err(_) => Outcome::Failed,
+    }
+}
+
+pub fn remove_package(host: &impl Host, pkg: &Package, observed: &Observed) -> Outcome {
+    if !observed.contains(&pkg.id) {
+        return Outcome::Satisfied;
+    }
+    match host.uninstall(pkg) {
+        Ok(()) => Outcome::Removed,
         Err(_) => Outcome::Failed,
     }
 }
@@ -231,6 +244,40 @@ impl Host for Live {
                     Ok(())
                 } else {
                     Err(Error::Message(format!("mas install {id} failed")))
+                }
+            }
+        }
+    }
+
+    fn uninstall(&self, pkg: &Package) -> Result<(), Error> {
+        match pkg.kind {
+            Kind::Formula | Kind::Cask => {
+                let brew = find_brew().ok_or_else(|| Error::Message("brew not found".into()))?;
+                let flag = match pkg.kind {
+                    Kind::Cask => "--cask",
+                    _ => "--formula",
+                };
+                let status = Command::new(&brew)
+                    .args(["uninstall", flag, &pkg.name])
+                    .status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(Error::Message(format!("brew uninstall {} failed", pkg.name)))
+                }
+            }
+            Kind::Mas => {
+                let id = pkg
+                    .mas_id
+                    .ok_or_else(|| Error::Message("mas entry missing id".into()))?;
+                let mas = find_mas().ok_or_else(|| Error::Message("mas not found".into()))?;
+                let status = Command::new(&mas)
+                    .args(["uninstall", &id.to_string()])
+                    .status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(Error::Message(format!("mas uninstall {id} failed")))
                 }
             }
         }
@@ -420,6 +467,7 @@ pub struct FakeHost {
     pub brew_calls: Cell<u32>,
     pub omz_calls: Cell<u32>,
     pub installs: RefCell<Vec<PkgId>>,
+    pub uninstalls: RefCell<Vec<PkgId>>,
     pub fail: Cell<bool>,
     pub facts: RefCell<HashMap<PkgId, BrewFacts>>,
 }
@@ -436,6 +484,7 @@ impl Default for FakeHost {
             brew_calls: Cell::new(0),
             omz_calls: Cell::new(0),
             installs: RefCell::new(Vec::new()),
+            uninstalls: RefCell::new(Vec::new()),
             fail: Cell::new(false),
             facts: RefCell::new(HashMap::new()),
         }
@@ -495,6 +544,15 @@ impl Host for FakeHost {
         }
         self.installs.borrow_mut().push(pkg.id.clone());
         self.installed.borrow_mut().insert(pkg.id.clone());
+        Ok(())
+    }
+
+    fn uninstall(&self, pkg: &Package) -> Result<(), Error> {
+        if self.fail.get() {
+            return Err(Error::Message("uninstall".into()));
+        }
+        self.uninstalls.borrow_mut().push(pkg.id.clone());
+        self.installed.borrow_mut().remove(&pkg.id);
         Ok(())
     }
 
@@ -584,6 +642,28 @@ mod tests {
         let observed = host.installed.borrow().clone();
         assert_eq!(ensure_package(&host, &pkg, &observed), Outcome::Satisfied);
         assert_eq!(host.installs.borrow().len(), 1);
+    }
+
+    #[test]
+    fn package_removes_when_deselected() {
+        let host = FakeHost::default();
+        let pkg = Package {
+            id: PkgId::new(Kind::Formula, "git", None),
+            kind: Kind::Formula,
+            name: "git".into(),
+            mas_id: None,
+            title: "Git".into(),
+            category: "CLI".into(),
+            description: None,
+            available: None,
+            installed_version: None,
+        };
+        host.installed.borrow_mut().insert(pkg.id.clone());
+        let observed = host.installed.borrow().clone();
+        assert_eq!(remove_package(&host, &pkg, &observed), Outcome::Removed);
+        assert_eq!(*host.uninstalls.borrow(), vec![pkg.id.clone()]);
+        assert!(!host.installed.borrow().contains(&pkg.id));
+        assert_eq!(remove_package(&host, &pkg, &Observed::new()), Outcome::Satisfied);
     }
 
     #[test]
