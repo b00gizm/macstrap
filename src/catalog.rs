@@ -10,6 +10,96 @@ pub enum Kind {
     Mas,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Origin {
+    Builtin,
+}
+
+impl Origin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CatalogId {
+    CliEssentials,
+    NodeEssentials,
+    NodeFull,
+    PythonEssentials,
+    PythonFull,
+    RustEssentials,
+    RustFull,
+}
+
+pub struct CatalogFile {
+    pub id: CatalogId,
+    pub origin: Origin,
+    pub required: bool,
+    yaml: &'static str,
+}
+
+impl CatalogFile {
+    pub fn doc(&self) -> Result<CatalogDoc, String> {
+        load(self.yaml)
+    }
+}
+
+const FILES: &[CatalogFile] = &[
+    CatalogFile {
+        id: CatalogId::CliEssentials,
+        origin: Origin::Builtin,
+        required: true,
+        yaml: include_str!("../catalogs/cli-essentials.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::NodeEssentials,
+        origin: Origin::Builtin,
+        required: false,
+        yaml: include_str!("../catalogs/node-essentials.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::NodeFull,
+        origin: Origin::Builtin,
+        required: false,
+        yaml: include_str!("../catalogs/node-full.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::PythonEssentials,
+        origin: Origin::Builtin,
+        required: false,
+        yaml: include_str!("../catalogs/python-essentials.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::PythonFull,
+        origin: Origin::Builtin,
+        required: false,
+        yaml: include_str!("../catalogs/python-full.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::RustEssentials,
+        origin: Origin::Builtin,
+        required: false,
+        yaml: include_str!("../catalogs/rust-essentials.yml"),
+    },
+    CatalogFile {
+        id: CatalogId::RustFull,
+        origin: Origin::Builtin,
+        required: false,
+        yaml: include_str!("../catalogs/rust-full.yml"),
+    },
+];
+
+pub fn files() -> &'static [CatalogFile] {
+    FILES
+}
+
+pub fn default_loaded() -> HashSet<CatalogId> {
+    FILES.iter().filter(|f| f.required).map(|f| f.id).collect()
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PkgId(String);
 
@@ -32,12 +122,37 @@ pub struct Package {
     pub mas_id: Option<u64>,
     pub title: String,
     pub category: String,
+    pub description: Option<String>,
+    pub available: Option<String>,
+    pub installed_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BrewFacts {
+    pub description: Option<String>,
+    pub available: Option<String>,
+    pub installed: Option<String>,
 }
 
 pub type Catalog = Vec<Package>;
 pub type Desired = HashMap<PkgId, Package>;
 pub type Observed = HashSet<PkgId>;
 pub type Selection = HashMap<PkgId, bool>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogDoc {
+    pub title: String,
+    pub description: Option<String>,
+    pub packages: Catalog,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogYaml {
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    packages: Vec<CatalogRow>,
+}
 
 #[derive(Debug, Deserialize)]
 struct CatalogRow {
@@ -47,6 +162,8 @@ struct CatalogRow {
     mas_id: Option<u64>,
     title: String,
     category: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 impl From<CatalogRow> for Package {
@@ -59,19 +176,38 @@ impl From<CatalogRow> for Package {
             mas_id: row.mas_id,
             title: row.title,
             category: row.category,
+            description: row.description,
+            available: None,
+            installed_version: None,
         }
     }
 }
 
-const CATALOG_YAML: &str = include_str!("../catalog.yaml");
-
-pub fn load_embedded() -> Result<Catalog, String> {
-    load(CATALOG_YAML)
+pub fn load(yaml: &str) -> Result<CatalogDoc, String> {
+    let doc: CatalogYaml = serde_yaml::from_str(yaml).map_err(|e| format!("catalog: {e}"))?;
+    Ok(CatalogDoc {
+        title: doc.title,
+        description: doc.description,
+        packages: doc.packages.into_iter().map(Package::from).collect(),
+    })
 }
 
-pub fn load(yaml: &str) -> Result<Catalog, String> {
-    let rows: Vec<CatalogRow> = serde_yaml::from_str(yaml).map_err(|e| format!("catalog: {e}"))?;
-    Ok(rows.into_iter().map(Package::from).collect())
+pub fn compose(loaded: &HashSet<CatalogId>) -> Result<Catalog, String> {
+    let mut active = default_loaded();
+    active.extend(loaded.iter().copied());
+    let mut packages = Catalog::new();
+    let mut seen = HashSet::new();
+    for file in FILES {
+        if !active.contains(&file.id) {
+            continue;
+        }
+        for pkg in load(file.yaml)?.packages {
+            if seen.insert(pkg.id.clone()) {
+                packages.push(pkg);
+            }
+        }
+    }
+    Ok(packages)
 }
 
 pub struct Merge {
@@ -91,9 +227,34 @@ pub fn merge(catalog: &[Package], desired: &Desired) -> Merge {
             selection.insert(id.clone(), true);
         }
     }
+    packages.sort_by(|a, b| {
+        a.title
+            .to_ascii_lowercase()
+            .cmp(&b.title.to_ascii_lowercase())
+    });
     Merge {
         packages,
         selection,
+    }
+}
+
+pub fn needs_brew_facts(pkg: &Package) -> bool {
+    matches!(pkg.kind, Kind::Formula | Kind::Cask)
+}
+
+pub fn apply_facts(packages: &mut [Package], facts: &HashMap<PkgId, BrewFacts>) {
+    for pkg in packages {
+        if !needs_brew_facts(pkg) {
+            continue;
+        }
+        let Some(fact) = facts.get(&pkg.id) else {
+            continue;
+        };
+        if pkg.description.is_none() {
+            pkg.description = fact.description.clone();
+        }
+        pkg.available = fact.available.clone();
+        pkg.installed_version = fact.installed.clone();
     }
 }
 
@@ -124,22 +285,140 @@ mod tests {
             mas_id,
             title: name.to_string(),
             category: "Test".to_string(),
+            description: None,
+            available: None,
+            installed_version: None,
+        }
+    }
+
+    fn names(catalog: &[Package]) -> HashSet<&str> {
+        catalog.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn compose_always_includes_cli_essentials() {
+        let catalog = compose(&HashSet::new()).unwrap();
+        let names = names(&catalog);
+        assert!(names.contains("git"));
+        assert!(names.contains("jq"));
+        assert!(!names.contains("node"));
+        assert!(!names.contains("rustup"));
+        assert!(!names.contains("python@3.14"));
+    }
+
+    #[test]
+    fn compose_unions_and_dedups() {
+        let loaded = HashSet::from([CatalogId::NodeEssentials, CatalogId::NodeFull]);
+        let catalog = compose(&loaded).unwrap();
+        let names = names(&catalog);
+        assert!(names.contains("git"));
+        assert!(names.contains("node"));
+        assert!(names.contains("pnpm"));
+        assert!(names.contains("bun"));
+        assert_eq!(
+            catalog.iter().filter(|p| p.name == "node").count(),
+            1,
+            "node from essentials and full must collapse to one row"
+        );
+    }
+
+    #[test]
+    fn yaml_description_is_optional() {
+        let doc = load(
+            r#"
+title: Example
+packages:
+  - name: git
+    kind: formula
+    title: Git
+    category: CLI
+    description: Distributed version control
+  - name: jq
+    kind: formula
+    title: jq
+    category: CLI
+"#,
+        )
+        .unwrap();
+        assert_eq!(doc.title, "Example");
+        assert_eq!(doc.description, None);
+        assert_eq!(
+            doc.packages[0].description.as_deref(),
+            Some("Distributed version control")
+        );
+        assert_eq!(doc.packages[1].description, None);
+    }
+
+    #[test]
+    fn apply_facts_fills_gaps_keeps_yaml_and_sets_versions() {
+        let mut packages = vec![
+            pkg(Kind::Formula, "git", None),
+            pkg(Kind::Formula, "jq", None),
+            pkg(Kind::Mas, "Yoink", Some(457622435)),
+        ];
+        packages[0].description = Some("from yaml".into());
+        let mut facts = HashMap::new();
+        facts.insert(
+            PkgId::new(Kind::Formula, "git", None),
+            BrewFacts {
+                description: Some("from brew".into()),
+                available: Some("2.55.0".into()),
+                installed: Some("2.53.0_1".into()),
+            },
+        );
+        facts.insert(
+            PkgId::new(Kind::Formula, "jq", None),
+            BrewFacts {
+                description: Some("jq desc".into()),
+                available: Some("1.8.2".into()),
+                installed: None,
+            },
+        );
+        apply_facts(&mut packages, &facts);
+        assert_eq!(packages[0].description.as_deref(), Some("from yaml"));
+        assert_eq!(packages[0].available.as_deref(), Some("2.55.0"));
+        assert_eq!(packages[0].installed_version.as_deref(), Some("2.53.0_1"));
+        assert_eq!(packages[1].description.as_deref(), Some("jq desc"));
+        assert_eq!(packages[1].available.as_deref(), Some("1.8.2"));
+        assert_eq!(packages[1].installed_version, None);
+        assert_eq!(packages[2].description, None);
+        assert_eq!(packages[2].available, None);
+        assert!(needs_brew_facts(&pkg(Kind::Formula, "fd", None)));
+        assert!(!needs_brew_facts(&packages[2]));
+    }
+
+    #[test]
+    fn bundled_files_are_builtin() {
+        assert!(
+            FILES
+                .iter()
+                .all(|f| f.origin == Origin::Builtin && f.origin.label() == "builtin")
+        );
+    }
+
+    #[test]
+    fn each_catalog_file_parses() {
+        for file in FILES {
+            let doc = file.doc().unwrap();
+            assert!(!doc.title.is_empty());
+            assert!(
+                !doc.packages.is_empty(),
+                "{} must list at least one package",
+                doc.title
+            );
         }
     }
 
     #[test]
-    fn load_embedded_catalog() {
-        let catalog = load_embedded().unwrap();
-        assert!(
-            catalog
-                .iter()
-                .any(|p| p.name == "git" && p.kind == Kind::Formula)
-        );
-        assert!(
-            catalog
-                .iter()
-                .any(|p| p.name == "visual-studio-code" && p.kind == Kind::Cask)
-        );
+    fn merge_sorts_by_title() {
+        let catalog = vec![
+            pkg(Kind::Formula, "jq", None),
+            pkg(Kind::Formula, "Git", None),
+            pkg(Kind::Formula, "fd", None),
+        ];
+        let merged = merge(&catalog, &Desired::new());
+        let titles: Vec<&str> = merged.packages.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["fd", "Git", "jq"]);
     }
 
     #[test]

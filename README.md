@@ -26,13 +26,17 @@ cargo run
 cargo run -- --help
 ```
 
-`--yes` applies the Brewfile selection without the picker.
+`--yes` applies `cli-essentials.yml` plus the Brewfile selection, without the picker. Optional catalogs are a picker action.
 
 `--brewfile PATH` reads that file instead of `$HOME/Brewfile` or `$HOME/.Brewfile`.
 
 `--essentials-only` stops after Command Line Tools, Homebrew, and oh-my-zsh.
 
-The picker uses `space` to toggle, `a` for all, `n` for none, `/` to filter, and `enter` to confirm. `q` or `ctrl+c` aborts. Already installed rows stay visible and are skipped on apply.
+The picker uses `space` to toggle, `a` for all, `n` for none, `/` to filter, `c` for catalogs, and `enter` to confirm. `q` or `ctrl+c` aborts. Already installed rows stay visible and are skipped on apply.
+
+`c` opens the catalog list. Each row shows an origin and a description. Bundled files are `builtin`. `cli-essentials.yml` is always loaded. Space loads or unloads the others. The tool list updates as soon as a file is loaded or unloaded.
+
+Descriptions are optional. An empty description stays blank. A formula or cask without one uses `brew info`. That same call fills the installed and available version columns.
 
 Deselect does not uninstall. The tool does not change your login shell unless it is still bash.
 
@@ -40,4 +44,12 @@ Deselect does not uninstall. The tool does not change your login shell unless it
 
 v1 reads `brew "name"`, `cask "name"`, and `mas "Title", id: 123`. Other lines are skipped and counted.
 
-The curated list lives in `catalog.yaml`. Names that appear only in the Brewfile still show up in the picker.
+Curated lists live in `catalogs/`. `cli-essentials.yml` is always on. The others are optional:
+
+- `node-essentials.yml` and `node-full.yml`
+- `python-essentials.yml` and `python-full.yml`
+- `rust-essentials.yml` and `rust-full.yml`
+
+A full file is a superset of the matching essentials file. Names that appear only in the Brewfile still show up in the picker.
+
+Each catalog file has a `title`, an optional `description`, and a `packages` list. Origin is not in the file. The app stamps `builtin` for bundled catalogs.

@@ -1,0 +1,31 @@
+title: Python full
+description: Opinionated Python setup
+packages:
+  - name: python@3.14
+    kind: formula
+    title: Python 3.14
+    category: Languages
+  - name: uv
+    kind: formula
+    title: uv
+    category: Languages
+  - name: pipx
+    kind: formula
+    title: pipx
+    category: Languages
+  - name: poetry
+    kind: formula
+    title: Poetry
+    category: Languages
+  - name: ruff
+    kind: formula
+    title: Ruff
+    category: Languages
+  - name: mypy
+    kind: formula
+    title: mypy
+    category: Languages
+  - name: ipython
+    kind: formula
+    title: IPython
+    category: Languages

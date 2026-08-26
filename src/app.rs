@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
@@ -10,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::brewfile;
-use crate::catalog::{self, Kind, Observed, Package, Selection};
+use crate::catalog::{self, CatalogId, Desired, Kind, Observed, Package, Selection};
 use crate::ensure::{self, Error, Host, Outcome};
 
 #[derive(Debug, Parser)]
@@ -26,12 +27,20 @@ pub struct Opts {
 
 enum Page {
     Pick,
+    Catalogs,
     Confirm,
 }
 
 enum PickAction {
     Continue,
+    Catalogs,
     Confirm,
+    Abort,
+}
+
+enum CatalogsAction {
+    Continue,
+    Done,
     Abort,
 }
 
@@ -39,7 +48,11 @@ pub struct CatalogList {
     pub packages: Vec<Package>,
     pub selection: Selection,
     pub observed: Observed,
+    pub loaded: HashSet<CatalogId>,
+    pub desired: Desired,
     pub cursor: usize,
+    pub catalog_cursor: usize,
+    pub facts: HashMap<catalog::PkgId, catalog::BrewFacts>,
     pub filter: String,
     pub filtering: bool,
 }
@@ -57,6 +70,10 @@ impl CatalogList {
                 pkg.title.to_ascii_lowercase().contains(&q)
                     || pkg.name.to_ascii_lowercase().contains(&q)
                     || pkg.category.to_ascii_lowercase().contains(&q)
+                    || pkg
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| d.to_ascii_lowercase().contains(&q))
             })
             .map(|(i, _)| i)
             .collect()
@@ -96,6 +113,73 @@ impl CatalogList {
         self.cursor = next.clamp(0, len as isize - 1) as usize;
     }
 
+    pub fn reload(&mut self) {
+        let catalog = catalog::compose(&self.loaded).expect("embedded catalogs parse");
+        let merged = catalog::merge(&catalog, &self.desired);
+        let old = std::mem::take(&mut self.selection);
+        self.packages = merged.packages;
+        self.selection = merged.selection;
+        for (id, on) in old {
+            if self.selection.contains_key(&id) {
+                self.selection.insert(id, on);
+            }
+        }
+        catalog::apply_facts(&mut self.packages, &self.facts);
+        let vis = self.visible().len();
+        self.cursor = if vis == 0 {
+            0
+        } else {
+            self.cursor.min(vis - 1)
+        };
+    }
+
+    pub fn toggle_catalog(&mut self) {
+        let Some(file) = catalog::files().get(self.catalog_cursor) else {
+            return;
+        };
+        if file.required {
+            return;
+        }
+        if !self.loaded.remove(&file.id) {
+            self.loaded.insert(file.id);
+        }
+        self.reload();
+    }
+
+    fn move_catalog_cursor(&mut self, delta: isize) {
+        let len = catalog::files().len();
+        if len == 0 {
+            self.catalog_cursor = 0;
+            return;
+        }
+        let next = self.catalog_cursor as isize + delta;
+        self.catalog_cursor = next.clamp(0, len as isize - 1) as usize;
+    }
+
+    fn handle_catalog_key(&mut self, key: KeyEvent) -> CatalogsAction {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => CatalogsAction::Done,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                CatalogsAction::Abort
+            }
+            KeyCode::Char('c') => CatalogsAction::Done,
+            KeyCode::Char('q') => CatalogsAction::Abort,
+            KeyCode::Char(' ') => {
+                self.toggle_catalog();
+                CatalogsAction::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_catalog_cursor(1);
+                CatalogsAction::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_catalog_cursor(-1);
+                CatalogsAction::Continue
+            }
+            _ => CatalogsAction::Continue,
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> PickAction {
         if self.filtering {
             match key.code {
@@ -122,6 +206,7 @@ impl CatalogList {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 PickAction::Abort
             }
+            KeyCode::Char('c') => PickAction::Catalogs,
             KeyCode::Char('/') => {
                 self.filtering = true;
                 PickAction::Continue
@@ -172,7 +257,8 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         return Ok(0);
     }
 
-    let catalog = catalog::load_embedded().map_err(Error::Message)?;
+    let loaded = catalog::default_loaded();
+    let catalog = catalog::compose(&loaded).map_err(Error::Message)?;
     let (desired, skipped) = load_brewfile(opts.brewfile.as_ref())?;
     if !skipped.is_empty() {
         println!(
@@ -180,7 +266,7 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
             skipped.len()
         );
     }
-    let merged = catalog::merge(&catalog, &desired);
+    let mut merged = catalog::merge(&catalog, &desired);
     let observed = host.installed()?;
 
     if opts.yes {
@@ -192,11 +278,25 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         ));
     }
 
+    let all: HashSet<catalog::CatalogId> = catalog::files().iter().map(|f| f.id).collect();
+    let mut universe = catalog::compose(&all).map_err(Error::Message)?;
+    for pkg in desired.values() {
+        if !universe.iter().any(|p| p.id == pkg.id) {
+            universe.push(pkg.clone());
+        }
+    }
+    let facts = host.brew_facts(&universe)?;
+    catalog::apply_facts(&mut merged.packages, &facts);
+
     let mut list = CatalogList {
         packages: merged.packages,
         selection: merged.selection,
         observed: observed.clone(),
+        loaded,
+        desired,
         cursor: 0,
+        catalog_cursor: 0,
+        facts,
         filter: String::new(),
         filtering: false,
     };
@@ -261,6 +361,9 @@ fn apply(
             mas_id: None,
             title: "mas".into(),
             category: "CLI".into(),
+            description: None,
+            available: None,
+            installed_version: None,
         };
         let mas = packages.iter().find(|p| p.id == mas_id).unwrap_or(&owned);
         let outcome = ensure::ensure_package(host, mas, &seen);
@@ -304,6 +407,7 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
         terminal
             .draw(|frame| match page {
                 Page::Pick => draw_pick(frame, list),
+                Page::Catalogs => draw_catalogs(frame, list),
                 Page::Confirm => draw_confirm(frame, list),
             })
             .map_err(|e| Error::Message(e.to_string()))?;
@@ -316,8 +420,14 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
         match page {
             Page::Pick => match list.handle_key(key) {
                 PickAction::Continue => {}
+                PickAction::Catalogs => page = Page::Catalogs,
                 PickAction::Confirm => page = Page::Confirm,
                 PickAction::Abort => return Ok(false),
+            },
+            Page::Catalogs => match list.handle_catalog_key(key) {
+                CatalogsAction::Continue => {}
+                CatalogsAction::Done => page = Page::Pick,
+                CatalogsAction::Abort => return Ok(false),
             },
             Page::Confirm => match key.code {
                 KeyCode::Enter => return Ok(true),
@@ -332,8 +442,26 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
     }
 }
 
+fn cell(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut chars: Vec<char> = s.chars().collect();
+    if chars.len() > width {
+        chars.truncate(width);
+        chars[width - 1] = '…';
+    }
+    let mut out: String = chars.into_iter().collect();
+    while out.chars().count() < width {
+        out.push(' ');
+    }
+    out
+}
+
 fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
+    let inner = areas[0].width.saturating_sub(2) as usize;
+    let desc_w = inner.saturating_sub(72);
     let visible = list.visible();
     let items: Vec<ListItem> = visible
         .iter()
@@ -342,19 +470,18 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
             let pkg = &list.packages[i];
             let checked = list.selection.get(&pkg.id).copied().unwrap_or(false);
             let mark = if checked { "[x]" } else { "[ ]" };
-            let installed = if list.observed.contains(&pkg.id) {
-                "  installed"
-            } else {
-                ""
-            };
             let style = if vis_i == list.cursor {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
             ListItem::new(Line::from(vec![Span::raw(format!(
-                "{mark} {:<24} {:<12}{installed}",
-                pkg.title, pkg.category
+                "{mark} {} {} {} {} {}",
+                cell(&pkg.title, 24),
+                cell(&pkg.category, 12),
+                cell(pkg.description.as_deref().unwrap_or(""), desc_w),
+                cell(pkg.installed_version.as_deref().unwrap_or(""), 14),
+                cell(pkg.available.as_deref().unwrap_or(""), 14)
             ))]))
             .style(style)
         })
@@ -367,9 +494,41 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     let widget = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(widget, areas[0]);
     frame.render_widget(
-        Paragraph::new("space toggle  a all  n none  / filter  enter confirm  q abort"),
+        Paragraph::new("space toggle  a all  n none  / filter  c catalogs  enter confirm  q abort"),
         areas[1],
     );
+}
+
+fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
+    let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
+    let inner = areas[0].width.saturating_sub(2) as usize;
+    let desc_w = inner.saturating_sub(44);
+    let items: Vec<ListItem> = catalog::files()
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let checked = list.loaded.contains(&file.id) || file.required;
+            let mark = if checked { "[x]" } else { "[ ]" };
+            let extra = if file.required { "always on" } else { "" };
+            let style = if i == list.catalog_cursor {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let doc = file.doc().expect("embedded catalogs parse");
+            ListItem::new(Line::from(vec![Span::raw(format!(
+                "{mark} {} {} {} {}",
+                cell(&doc.title, 20),
+                cell(file.origin.label(), 8),
+                cell(doc.description.as_deref().unwrap_or(""), desc_w),
+                cell(extra, 9)
+            ))]))
+            .style(style)
+        })
+        .collect();
+    let widget = List::new(items).block(Block::default().borders(Borders::ALL).title("Catalogs"));
+    frame.render_widget(widget, areas[0]);
+    frame.render_widget(Paragraph::new("space load/unload  enter back"), areas[1]);
 }
 
 fn draw_confirm(frame: &mut ratatui::Frame, list: &CatalogList) {
@@ -394,6 +553,9 @@ mod tests {
             mas_id: None,
             title: name.into(),
             category: "CLI".into(),
+            description: None,
+            available: None,
+            installed_version: None,
         }
     }
 
@@ -407,7 +569,11 @@ mod tests {
             packages,
             selection,
             observed: Observed::new(),
+            loaded: catalog::default_loaded(),
+            desired: Desired::new(),
             cursor: 0,
+            catalog_cursor: 0,
+            facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
         }
@@ -418,9 +584,113 @@ mod tests {
     }
 
     #[test]
+    fn cell_clips_and_pads() {
+        assert_eq!(cell("hi", 4), "hi  ");
+        assert_eq!(cell("toolong", 4), "too…");
+        assert_eq!(cell("ab", 0), "");
+    }
+
+    #[test]
     fn q_aborts_picker() {
         let mut l = list();
         assert!(matches!(l.handle_key(key('q')), PickAction::Abort));
+    }
+
+    #[test]
+    fn c_opens_catalogs() {
+        let mut l = list();
+        assert!(matches!(l.handle_key(key('c')), PickAction::Catalogs));
+    }
+
+    fn live_list() -> CatalogList {
+        let loaded = catalog::default_loaded();
+        let catalog = catalog::compose(&loaded).unwrap();
+        let merged = catalog::merge(&catalog, &Desired::new());
+        CatalogList {
+            packages: merged.packages,
+            selection: merged.selection,
+            observed: Observed::new(),
+            loaded,
+            desired: Desired::new(),
+            cursor: 0,
+            catalog_cursor: 0,
+            facts: HashMap::new(),
+            filter: String::new(),
+            filtering: false,
+        }
+    }
+
+    fn catalog_index(id: CatalogId) -> usize {
+        catalog::files().iter().position(|f| f.id == id).unwrap()
+    }
+
+    #[test]
+    fn load_and_unload_refreshes_packages() {
+        let mut l = live_list();
+        assert!(!l.packages.iter().any(|p| p.name == "node"));
+
+        l.catalog_cursor = catalog_index(CatalogId::NodeEssentials);
+        l.toggle_catalog();
+        assert!(l.packages.iter().any(|p| p.name == "node"));
+        assert!(l.packages.iter().any(|p| p.name == "git"));
+
+        l.toggle_catalog();
+        assert!(!l.packages.iter().any(|p| p.name == "node"));
+        assert!(l.packages.iter().any(|p| p.name == "git"));
+    }
+
+    #[test]
+    fn required_catalog_stays_loaded() {
+        let mut l = live_list();
+        l.catalog_cursor = catalog_index(CatalogId::CliEssentials);
+        l.toggle_catalog();
+        assert!(l.loaded.contains(&CatalogId::CliEssentials));
+        assert!(l.packages.iter().any(|p| p.name == "git"));
+    }
+
+    #[test]
+    fn catalogs_space_reloads_list() {
+        let mut l = live_list();
+        l.catalog_cursor = catalog_index(CatalogId::NodeEssentials);
+        assert!(matches!(
+            l.handle_catalog_key(key(' ')),
+            CatalogsAction::Continue
+        ));
+        assert!(l.packages.iter().any(|p| p.name == "node"));
+        assert!(matches!(
+            l.handle_catalog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            CatalogsAction::Done
+        ));
+    }
+
+    #[test]
+    fn reload_applies_cached_brew_facts() {
+        let mut l = live_list();
+        l.facts.insert(
+            PkgId::new(Kind::Formula, "node", None),
+            catalog::BrewFacts {
+                description: Some("JavaScript runtime".into()),
+                available: Some("24.0.0".into()),
+                installed: Some("22.0.0".into()),
+            },
+        );
+        l.catalog_cursor = catalog_index(CatalogId::NodeEssentials);
+        l.toggle_catalog();
+        let node = l.packages.iter().find(|p| p.name == "node").unwrap();
+        assert_eq!(node.description.as_deref(), Some("JavaScript runtime"));
+        assert_eq!(node.available.as_deref(), Some("24.0.0"));
+        assert_eq!(node.installed_version.as_deref(), Some("22.0.0"));
+    }
+
+    #[test]
+    fn reload_keeps_user_toggles() {
+        let mut l = live_list();
+        let git = PkgId::new(Kind::Formula, "git", None);
+        l.selection.insert(git.clone(), true);
+        l.catalog_cursor = catalog_index(CatalogId::NodeEssentials);
+        l.toggle_catalog();
+        assert!(l.selection[&git]);
+        assert!(!l.selection[&PkgId::new(Kind::Formula, "node", None)]);
     }
 
     #[test]
@@ -453,7 +723,7 @@ mod tests {
             return;
         };
         let parsed = brewfile::parse(&src);
-        let catalog = catalog::load_embedded().unwrap();
+        let catalog = catalog::compose(&catalog::default_loaded()).unwrap();
         let merged = catalog::merge(&catalog, &parsed.desired);
         for id in parsed.desired.keys() {
             assert!(
@@ -465,12 +735,12 @@ mod tests {
 
     #[test]
     fn brewfile_preselect_matches_testdata() {
-        let catalog = catalog::load_embedded().unwrap();
+        let catalog = catalog::compose(&catalog::default_loaded()).unwrap();
         let parsed = brewfile::parse(include_str!("../testdata/Brewfile"));
         let merged = catalog::merge(&catalog, &parsed.desired);
         assert!(merged.selection[&PkgId::new(Kind::Formula, "git", None)]);
         assert!(merged.selection[&PkgId::new(Kind::Cask, "visual-studio-code", None)]);
         assert!(merged.selection[&PkgId::new(Kind::Mas, "Yoink", Some(457622435))]);
-        assert!(!merged.selection[&PkgId::new(Kind::Formula, "ripgrep", None)]);
+        assert!(!merged.selection[&PkgId::new(Kind::Formula, "fzf", None)]);
     }
 }
