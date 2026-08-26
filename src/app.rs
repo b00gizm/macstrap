@@ -320,12 +320,25 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         filtering: false,
         show_all_installed: false,
     };
-    let confirmed = pick(&mut list)?;
-    if !confirmed {
-        println!("aborted");
-        return Ok(1);
+    loop {
+        let confirmed = pick(&mut list)?;
+        if !confirmed {
+            println!("aborted");
+            return Ok(1);
+        }
+        if let Err(err) = apply(host, &list.packages, &list.selection, &list.observed) {
+            eprintln!("{err}");
+        }
+        refresh_list(host, &mut list)?;
     }
-    apply(host, &list.packages, &list.selection, &list.observed)
+}
+
+fn refresh_list(host: &impl Host, list: &mut CatalogList) -> Result<(), Error> {
+    list.observed = host.installed()?;
+    let universe = catalog::compose_all().map_err(Error::Message)?;
+    list.facts = host.brew_facts(&universe)?;
+    list.reload();
+    Ok(())
 }
 
 fn load_brewfile(explicit: Option<&PathBuf>) -> Result<(catalog::Desired, Vec<String>), Error> {
@@ -751,6 +764,18 @@ mod tests {
         l.select_all();
         assert!(l.selection[&PkgId::new(Kind::Formula, "ripgrep", None)]);
         assert!(!l.selection[&PkgId::new(Kind::Formula, "bun", None)]);
+    }
+
+    #[test]
+    fn refresh_list_syncs_observed_and_selection() {
+        let host = ensure::FakeHost::default();
+        let mut l = live_list();
+        let fd = PkgId::new(Kind::Formula, "fd", None);
+        l.selection.insert(fd.clone(), true);
+        host.installed.borrow_mut().insert(fd.clone());
+        refresh_list(&host, &mut l).unwrap();
+        assert!(l.observed.contains(&fd));
+        assert!(l.selection.get(&fd).copied().unwrap_or(false));
     }
 
     #[test]
