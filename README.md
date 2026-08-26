@@ -32,7 +32,7 @@ cargo run -- --help
 
 `--essentials-only` stops after Command Line Tools, Homebrew, and oh-my-zsh.
 
-After Command Line Tools, Homebrew, and oh-my-zsh, macstrap installs every package in `cli-essentials.yml` (git, gh, fd, fzf, jq) before opening the picker.
+After Command Line Tools, Homebrew, and oh-my-zsh, macstrap installs every package in `cli-essentials.yml` (git, gh, fd, fzf, jq, mas) before opening the picker.
 
 The picker uses `space` to toggle, `a` for all, `n` for none, `o` to show every installed brew package (off by default shows loaded catalogs plus installed tools from bundled catalogs), `/` to filter, `c` for catalogs, and `enter` to confirm. `q` or `ctrl+c` aborts. Installed rows start checked and render green. Installed tools outside loaded catalogs render grey. Unchecking an installed row runs `brew uninstall` (or `mas uninstall`) on apply. After apply, the picker returns so you can install or uninstall more tools. `cli-essentials.yml` rows stay checked and never uninstall.
 
