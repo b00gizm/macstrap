@@ -32,7 +32,7 @@ cargo run -- --help
 
 `--essentials-only` stops after Command Line Tools, Homebrew, and oh-my-zsh.
 
-The picker uses `space` to toggle, `a` for all, `n` for none, `/` to filter, `c` for catalogs, and `enter` to confirm. `q` or `ctrl+c` aborts. Installed rows start checked. Unchecking an installed row runs `brew uninstall` (or `mas uninstall`) on apply. `cli-essentials.yml` rows stay checked and never uninstall.
+The picker uses `space` to toggle, `a` for all, `n` for none, `o` to show every installed brew package (off by default shows loaded catalogs plus installed tools from bundled catalogs), `/` to filter, `c` for catalogs, and `enter` to confirm. `q` or `ctrl+c` aborts. Installed rows start checked. Unchecking an installed row runs `brew uninstall` (or `mas uninstall`) on apply. `cli-essentials.yml` rows stay checked and never uninstall.
 
 `c` opens the catalog list. Each row shows an origin and a description. Bundled files are `builtin`. `cli-essentials.yml` is always loaded. Space loads or unloads the others. The tool list updates as soon as a file is loaded or unloaded.
 

@@ -55,6 +55,7 @@ pub struct CatalogList {
     pub facts: HashMap<catalog::PkgId, catalog::BrewFacts>,
     pub filter: String,
     pub filtering: bool,
+    pub show_all_installed: bool,
 }
 
 impl CatalogList {
@@ -120,7 +121,14 @@ impl CatalogList {
 
     pub fn reload(&mut self) {
         let catalog = catalog::compose(&self.loaded).expect("embedded catalogs parse");
-        let merged = catalog::merge(&catalog, &self.desired);
+        let universe = catalog::compose_all().expect("embedded catalogs parse");
+        let mut merged = catalog::merge(&catalog, &self.desired);
+        catalog::include_observed(
+            &mut merged,
+            &self.observed,
+            &universe,
+            self.show_all_installed,
+        );
         let old = std::mem::take(&mut self.selection);
         self.packages = merged.packages;
         self.selection = merged.selection;
@@ -137,6 +145,11 @@ impl CatalogList {
         } else {
             self.cursor.min(vis - 1)
         };
+    }
+
+    pub fn toggle_show_all_installed(&mut self) {
+        self.show_all_installed = !self.show_all_installed;
+        self.reload();
     }
 
     pub fn toggle_catalog(&mut self) {
@@ -229,6 +242,10 @@ impl CatalogList {
                 self.select_none();
                 PickAction::Continue
             }
+            KeyCode::Char('o') => {
+                self.toggle_show_all_installed();
+                PickAction::Continue
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_cursor(1);
                 PickAction::Continue
@@ -274,6 +291,8 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
     }
     let mut merged = catalog::merge(&catalog, &desired);
     let observed = host.installed()?;
+    let universe = catalog::compose_all().map_err(Error::Message)?;
+    catalog::include_observed(&mut merged, &observed, &universe, false);
     catalog::preselect_installed(&mut merged.selection, &observed, None);
 
     if opts.yes {
@@ -285,13 +304,6 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         ));
     }
 
-    let all: HashSet<catalog::CatalogId> = catalog::files().iter().map(|f| f.id).collect();
-    let mut universe = catalog::compose(&all).map_err(Error::Message)?;
-    for pkg in desired.values() {
-        if !universe.iter().any(|p| p.id == pkg.id) {
-            universe.push(pkg.clone());
-        }
-    }
     let facts = host.brew_facts(&universe)?;
     catalog::apply_facts(&mut merged.packages, &facts);
 
@@ -306,6 +318,7 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         facts,
         filter: String::new(),
         filtering: false,
+        show_all_installed: false,
     };
     let confirmed = pick(&mut list)?;
     if !confirmed {
@@ -507,13 +520,17 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
         .collect();
     let title = if list.filtering {
         format!("Choose tools  /{}", list.filter)
+    } else if list.show_all_installed {
+        "Choose tools · all installed".into()
     } else {
-        "Choose tools".into()
+        "Choose tools · catalog".into()
     };
     let widget = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(widget, areas[0]);
     frame.render_widget(
-        Paragraph::new("space toggle  a all  n none  / filter  c catalogs  enter confirm  q abort"),
+        Paragraph::new(
+            "space toggle  a all  n none  o all installed  / filter  c catalogs  enter confirm  q abort",
+        ),
         areas[1],
     );
 }
@@ -597,6 +614,7 @@ mod tests {
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
+            show_all_installed: false,
         }
     }
 
@@ -638,6 +656,7 @@ mod tests {
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
+            show_all_installed: false,
         }
     }
 
@@ -773,6 +792,30 @@ mod tests {
         let observed = host.installed.borrow().clone();
         apply(&host, &packages, &selection, &observed).unwrap();
         assert_eq!(*host.uninstalls.borrow(), vec![rg.id]);
+    }
+
+    #[test]
+    fn observed_optional_catalog_survives_reload() {
+        let mut l = live_list();
+        let node_id = PkgId::new(Kind::Formula, "node", None);
+        l.observed.insert(node_id.clone());
+        l.reload();
+        assert!(l.packages.iter().any(|p| p.name == "node"));
+        assert!(l.selection.contains_key(&node_id));
+    }
+
+    #[test]
+    fn toggle_show_all_installed_adds_unknown_formula() {
+        let mut l = live_list();
+        let wget = PkgId::new(Kind::Formula, "wget", None);
+        l.observed.insert(wget.clone());
+        assert!(!l.packages.iter().any(|p| p.name == "wget"));
+        l.toggle_show_all_installed();
+        assert!(l.show_all_installed);
+        assert!(l.packages.iter().any(|p| p.name == "wget"));
+        l.toggle_show_all_installed();
+        assert!(!l.show_all_installed);
+        assert!(!l.packages.iter().any(|p| p.name == "wget"));
     }
 
     #[test]

@@ -224,6 +224,11 @@ pub fn compose(loaded: &HashSet<CatalogId>) -> Result<Catalog, String> {
     Ok(packages)
 }
 
+pub fn compose_all() -> Result<Catalog, String> {
+    let all: HashSet<CatalogId> = FILES.iter().map(|f| f.id).collect();
+    compose(&all)
+}
+
 pub struct Merge {
     pub packages: Catalog,
     pub selection: Selection,
@@ -250,6 +255,63 @@ pub fn merge(catalog: &[Package], desired: &Desired) -> Merge {
         packages,
         selection,
     }
+}
+
+pub fn include_observed(
+    merged: &mut Merge,
+    observed: &Observed,
+    universe: &[Package],
+    show_all_installed: bool,
+) {
+    for id in observed {
+        if merged.packages.iter().any(|p| &p.id == id) {
+            continue;
+        }
+        let pkg = match universe.iter().find(|p| &p.id == id) {
+            Some(pkg) => pkg.clone(),
+            None if show_all_installed => stub_from_id(id),
+            None => continue,
+        };
+        merged.selection.insert(id.clone(), false);
+        merged.packages.push(pkg);
+    }
+    merged.packages.sort_by(|a, b| {
+        a.title
+            .to_ascii_lowercase()
+            .cmp(&b.title.to_ascii_lowercase())
+    });
+}
+
+fn stub_from_id(id: &PkgId) -> Package {
+    let (kind, name, mas_id) = parse_id(id);
+    Package {
+        id: id.clone(),
+        kind,
+        name: name.clone(),
+        mas_id,
+        title: name,
+        category: "Installed".into(),
+        description: None,
+        available: None,
+        installed_version: None,
+    }
+}
+
+fn parse_id(id: &PkgId) -> (Kind, String, Option<u64>) {
+    let s = &id.0;
+    if let Some(name) = s.strip_prefix("formula:") {
+        return (Kind::Formula, name.to_string(), None);
+    }
+    if let Some(name) = s.strip_prefix("cask:") {
+        return (Kind::Cask, name.to_string(), None);
+    }
+    if let Some(rest) = s.strip_prefix("mas:") {
+        if let Ok(n) = rest.parse() {
+            return (Kind::Mas, rest.to_string(), Some(n));
+        }
+        return (Kind::Mas, rest.to_string(), None);
+    }
+    (Kind::Formula, s.clone(), None)
 }
 
 pub fn needs_brew_facts(pkg: &Package) -> bool {
@@ -537,6 +599,57 @@ packages:
         let out = pending_uninstall(&pkgs, &selection, &observed);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "ripgrep");
+    }
+
+    #[test]
+    fn include_observed_adds_installed_from_unloaded_catalog() {
+        let catalog = compose(&HashSet::new()).unwrap();
+        let mut merged = merge(&catalog, &Desired::new());
+        let node_id = PkgId::new(Kind::Formula, "node", None);
+        let mut observed = Observed::new();
+        observed.insert(node_id.clone());
+        let universe = compose_all().unwrap();
+        include_observed(&mut merged, &observed, &universe, false);
+        assert!(merged.packages.iter().any(|p| p.name == "node"));
+        assert!(merged.selection.contains_key(&node_id));
+        assert!(!merged.selection[&node_id]);
+    }
+
+    #[test]
+    fn include_observed_skips_rows_already_present() {
+        let loaded = HashSet::from([CatalogId::NodeEssentials]);
+        let catalog = compose(&loaded).unwrap();
+        let mut merged = merge(&catalog, &Desired::new());
+        let node_id = PkgId::new(Kind::Formula, "node", None);
+        let mut observed = Observed::new();
+        observed.insert(node_id.clone());
+        let before = merged.packages.len();
+        include_observed(&mut merged, &observed, &catalog, false);
+        assert_eq!(merged.packages.len(), before);
+    }
+
+    #[test]
+    fn include_observed_stubs_unknown_formula() {
+        let catalog = compose(&HashSet::new()).unwrap();
+        let mut merged = merge(&catalog, &Desired::new());
+        let id = PkgId::new(Kind::Formula, "wget", None);
+        let mut observed = Observed::new();
+        observed.insert(id.clone());
+        include_observed(&mut merged, &observed, &catalog, true);
+        let wget = merged.packages.iter().find(|p| p.name == "wget").unwrap();
+        assert_eq!(wget.category, "Installed");
+        assert_eq!(wget.title, "wget");
+    }
+
+    #[test]
+    fn include_observed_catalog_mode_skips_unknown_formula() {
+        let catalog = compose(&HashSet::new()).unwrap();
+        let mut merged = merge(&catalog, &Desired::new());
+        let id = PkgId::new(Kind::Formula, "wget", None);
+        let mut observed = Observed::new();
+        observed.insert(id.clone());
+        include_observed(&mut merged, &observed, &catalog, false);
+        assert!(!merged.packages.iter().any(|p| p.name == "wget"));
     }
 
     #[test]
