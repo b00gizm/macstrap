@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use serde::Deserialize;
 
@@ -98,6 +99,19 @@ pub fn files() -> &'static [CatalogFile] {
 
 pub fn default_loaded() -> HashSet<CatalogId> {
     FILES.iter().filter(|f| f.required).map(|f| f.id).collect()
+}
+
+static PROTECTED: LazyLock<HashSet<PkgId>> = LazyLock::new(|| {
+    FILES
+        .iter()
+        .filter(|f| f.required)
+        .flat_map(|f| load(f.yaml).expect("embedded catalogs parse").packages)
+        .map(|pkg| pkg.id)
+        .collect()
+});
+
+pub fn is_protected(id: &PkgId) -> bool {
+    PROTECTED.contains(id)
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -258,6 +272,22 @@ pub fn apply_facts(packages: &mut [Package], facts: &HashMap<PkgId, BrewFacts>) 
     }
 }
 
+pub fn preselect_installed(
+    selection: &mut Selection,
+    observed: &Observed,
+    prior: Option<&Selection>,
+) {
+    for id in observed {
+        if !selection.contains_key(id) {
+            continue;
+        }
+        if prior.is_some_and(|p| p.contains_key(id)) {
+            continue;
+        }
+        selection.insert(id.clone(), true);
+    }
+}
+
 pub fn pending<'a>(
     packages: &'a [Package],
     selection: &Selection,
@@ -267,6 +297,21 @@ pub fn pending<'a>(
         .iter()
         .filter(|pkg| {
             selection.get(&pkg.id).copied().unwrap_or(false) && !observed.contains(&pkg.id)
+        })
+        .collect()
+}
+
+pub fn pending_uninstall<'a>(
+    packages: &'a [Package],
+    selection: &Selection,
+    observed: &Observed,
+) -> Vec<&'a Package> {
+    packages
+        .iter()
+        .filter(|pkg| {
+            !is_protected(&pkg.id)
+                && !selection.get(&pkg.id).copied().unwrap_or(false)
+                && observed.contains(&pkg.id)
         })
         .collect()
 }
@@ -462,5 +507,46 @@ packages:
         let out = pending(&pkgs, &selection, &observed);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "ripgrep");
+    }
+
+    #[test]
+    fn preselect_installed_checks_observed_rows() {
+        let git = pkg(Kind::Formula, "git", None);
+        let rg = pkg(Kind::Formula, "ripgrep", None);
+        let mut selection = Selection::new();
+        selection.insert(git.id.clone(), false);
+        selection.insert(rg.id.clone(), false);
+        let mut observed = Observed::new();
+        observed.insert(git.id.clone());
+        preselect_installed(&mut selection, &observed, None);
+        assert!(selection[&git.id]);
+        assert!(!selection[&rg.id]);
+    }
+
+    #[test]
+    fn pending_uninstall_deselected_observed() {
+        let git = pkg(Kind::Formula, "git", None);
+        let rg = pkg(Kind::Formula, "ripgrep", None);
+        let mut selection = Selection::new();
+        selection.insert(git.id.clone(), true);
+        selection.insert(rg.id.clone(), false);
+        let mut observed = Observed::new();
+        observed.insert(git.id.clone());
+        observed.insert(rg.id.clone());
+        let pkgs = [git, rg];
+        let out = pending_uninstall(&pkgs, &selection, &observed);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "ripgrep");
+    }
+
+    #[test]
+    fn pending_uninstall_skips_cli_essentials() {
+        let git = pkg(Kind::Formula, "git", None);
+        let mut selection = Selection::new();
+        selection.insert(git.id.clone(), false);
+        let mut observed = Observed::new();
+        observed.insert(git.id.clone());
+        assert!(is_protected(&git.id));
+        assert!(pending_uninstall(&[git], &selection, &observed).is_empty());
     }
 }
