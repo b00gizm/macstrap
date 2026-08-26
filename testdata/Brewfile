@@ -1,0 +1,9 @@
+brew "coreutils"
+brew "git"
+brew "mas"
+cask "visual-studio-code"
+cask "orbstack"
+mas "Fantastical", id: 975937182
+mas "Yoink", id: 457622435
+tap "homebrew/core"
+vscode "editorconfig.editorconfig"

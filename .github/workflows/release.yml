@@ -1,0 +1,53 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset_arch: arm64
+          - os: macos-13
+            asset_arch: amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: |
+          NAME=$(sed -n 's/^name = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          ASSET="${NAME}_darwin_${{ matrix.asset_arch }}.tar.gz"
+          tar -czf "$ASSET" -C target/release "$NAME"
+          shasum -a 256 "$ASSET" > "${ASSET}.sha256"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-${{ matrix.asset_arch }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: cat *.sha256 > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
