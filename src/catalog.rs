@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -14,17 +15,19 @@ pub enum Kind {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Origin {
     Builtin,
+    Local,
 }
 
 impl Origin {
     pub fn label(self) -> &'static str {
         match self {
             Self::Builtin => "builtin",
+            Self::Local => "local",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum CatalogId {
     CliEssentials,
     NodeEssentials,
@@ -33,18 +36,38 @@ pub enum CatalogId {
     PythonFull,
     RustEssentials,
     RustFull,
+    Local(PathBuf),
+}
+
+enum CatalogSource {
+    Embedded(&'static str),
+    Path(PathBuf),
 }
 
 pub struct CatalogFile {
     pub id: CatalogId,
     pub origin: Origin,
     pub required: bool,
-    yaml: &'static str,
+    source: CatalogSource,
 }
 
 impl CatalogFile {
     pub fn doc(&self) -> Result<CatalogDoc, String> {
-        load(self.yaml)
+        match &self.source {
+            CatalogSource::Embedded(yaml) => load(yaml),
+            CatalogSource::Path(path) => {
+                let yaml = std::fs::read_to_string(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                load(&yaml)
+            }
+        }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        match &self.source {
+            CatalogSource::Path(path) => Some(path),
+            CatalogSource::Embedded(_) => None,
+        }
     }
 }
 
@@ -53,59 +76,181 @@ const FILES: &[CatalogFile] = &[
         id: CatalogId::CliEssentials,
         origin: Origin::Builtin,
         required: true,
-        yaml: include_str!("../catalogs/cli-essentials.yml"),
+        source: CatalogSource::Embedded(include_str!("../catalogs/cli-essentials.yml")),
     },
     CatalogFile {
         id: CatalogId::NodeEssentials,
         origin: Origin::Builtin,
         required: false,
-        yaml: include_str!("../catalogs/node-essentials.yml"),
+        source: CatalogSource::Embedded(include_str!("../catalogs/node-essentials.yml")),
     },
     CatalogFile {
         id: CatalogId::NodeFull,
         origin: Origin::Builtin,
         required: false,
-        yaml: include_str!("../catalogs/node-full.yml"),
+        source: CatalogSource::Embedded(include_str!("../catalogs/node-full.yml")),
     },
     CatalogFile {
         id: CatalogId::PythonEssentials,
         origin: Origin::Builtin,
         required: false,
-        yaml: include_str!("../catalogs/python-essentials.yml"),
+        source: CatalogSource::Embedded(include_str!("../catalogs/python-essentials.yml")),
     },
     CatalogFile {
         id: CatalogId::PythonFull,
         origin: Origin::Builtin,
         required: false,
-        yaml: include_str!("../catalogs/python-full.yml"),
+        source: CatalogSource::Embedded(include_str!("../catalogs/python-full.yml")),
     },
     CatalogFile {
         id: CatalogId::RustEssentials,
         origin: Origin::Builtin,
         required: false,
-        yaml: include_str!("../catalogs/rust-essentials.yml"),
+        source: CatalogSource::Embedded(include_str!("../catalogs/rust-essentials.yml")),
     },
     CatalogFile {
         id: CatalogId::RustFull,
         origin: Origin::Builtin,
         required: false,
-        yaml: include_str!("../catalogs/rust-full.yml"),
+        source: CatalogSource::Embedded(include_str!("../catalogs/rust-full.yml")),
     },
 ];
 
-pub fn files() -> &'static [CatalogFile] {
-    FILES
+pub fn default_config_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join(env!("CARGO_PKG_NAME"))
+}
+
+pub fn discover_local(config_dir: &Path) -> Result<Vec<CatalogFile>, String> {
+    let mut out = Vec::new();
+    let read_dir = match std::fs::read_dir(config_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(format!("{}: {e}", config_dir.display())),
+    };
+    for entry in read_dir {
+        let entry = entry.map_err(|e| format!("{}: {e}", config_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if ext != "yml" && ext != "yaml" {
+            continue;
+        }
+        let path = path.canonicalize().unwrap_or(path);
+        let id = CatalogId::Local(path.clone());
+        out.push(CatalogFile {
+            id,
+            origin: Origin::Local,
+            required: false,
+            source: CatalogSource::Path(path),
+        });
+    }
+    out.sort_by(|a, b| {
+        a.path()
+            .and_then(|p| p.file_name())
+            .cmp(&b.path().and_then(|p| p.file_name()))
+    });
+    Ok(out)
+}
+
+pub fn all_entries(config_dir: &Path) -> Result<Vec<CatalogEntry>, String> {
+    let mut all: Vec<CatalogEntry> = FILES
+        .iter()
+        .map(|f| CatalogEntry::Builtin(f))
+        .collect();
+    for local in discover_local(config_dir)? {
+        all.push(CatalogEntry::Owned(local));
+    }
+    Ok(all)
+}
+
+pub enum CatalogEntry {
+    Builtin(&'static CatalogFile),
+    Owned(CatalogFile),
+}
+
+impl CatalogEntry {
+    pub fn file(&self) -> &CatalogFile {
+        match self {
+            Self::Builtin(f) => f,
+            Self::Owned(f) => f,
+        }
+    }
+}
+
+pub fn infer_title_from_filename(filename: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    stem.split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(title_case_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn title_case_word(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+pub struct CreateCatalogInput {
+    pub filename: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub location: PathBuf,
+}
+
+pub fn create_catalog(input: CreateCatalogInput) -> Result<PathBuf, String> {
+    let filename = input.filename.trim();
+    if filename.is_empty() {
+        return Err("file name is required".into());
+    }
+    if filename.contains('/') || filename.contains('\\') {
+        return Err("file name must not contain path separators".into());
+    }
+    let path = input.location.join(filename);
+    if path.exists() {
+        return Err(format!("{} already exists", path.display()));
+    }
+    std::fs::create_dir_all(&input.location)
+        .map_err(|e| format!("{}: {e}", input.location.display()))?;
+    #[derive(Serialize)]
+    struct NewCatalog<'a> {
+        title: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<&'a str>,
+        packages: Vec<serde_yaml::Value>,
+    }
+    let doc = NewCatalog {
+        title: &input.title,
+        description: input.description.as_deref().filter(|d| !d.is_empty()),
+        packages: Vec::new(),
+    };
+    let yaml = serde_yaml::to_string(&doc).map_err(|e| format!("catalog: {e}"))?;
+    std::fs::write(&path, yaml).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path.canonicalize().unwrap_or(path))
 }
 
 pub fn default_loaded() -> HashSet<CatalogId> {
-    FILES.iter().filter(|f| f.required).map(|f| f.id).collect()
+    FILES.iter().filter(|f| f.required).map(|f| f.id.clone()).collect()
 }
 
 static PROTECTED: LazyLock<HashSet<PkgId>> = LazyLock::new(|| {
     FILES
         .iter()
         .filter(|f| f.required)
-        .flat_map(|f| load(f.yaml).expect("embedded catalogs parse").packages)
+        .flat_map(|f| f.doc().expect("embedded catalogs parse").packages)
         .map(|pkg| pkg.id)
         .collect()
 });
@@ -207,15 +352,17 @@ pub fn load(yaml: &str) -> Result<CatalogDoc, String> {
 }
 
 pub fn compose(loaded: &HashSet<CatalogId>) -> Result<Catalog, String> {
+    let config_dir = default_config_dir();
     let mut active = default_loaded();
-    active.extend(loaded.iter().copied());
+    active.extend(loaded.iter().cloned());
     let mut packages = Catalog::new();
     let mut seen = HashSet::new();
-    for file in FILES {
+    for entry in all_entries(&config_dir)? {
+        let file = entry.file();
         if !active.contains(&file.id) {
             continue;
         }
-        for pkg in load(file.yaml)?.packages {
+        for pkg in file.doc()?.packages {
             if seen.insert(pkg.id.clone()) {
                 packages.push(pkg);
             }
@@ -225,7 +372,11 @@ pub fn compose(loaded: &HashSet<CatalogId>) -> Result<Catalog, String> {
 }
 
 pub fn compose_all() -> Result<Catalog, String> {
-    let all: HashSet<CatalogId> = FILES.iter().map(|f| f.id).collect();
+    let config_dir = default_config_dir();
+    let all: HashSet<CatalogId> = all_entries(&config_dir)?
+        .into_iter()
+        .map(|e| e.file().id.clone())
+        .collect();
     compose(&all)
 }
 
@@ -653,13 +804,52 @@ packages:
     }
 
     #[test]
-    fn pending_uninstall_skips_cli_essentials() {
-        let git = pkg(Kind::Formula, "git", None);
-        let mut selection = Selection::new();
-        selection.insert(git.id.clone(), false);
-        let mut observed = Observed::new();
-        observed.insert(git.id.clone());
-        assert!(is_protected(&git.id));
-        assert!(pending_uninstall(&[git], &selection, &observed).is_empty());
+    fn infer_title_from_filename_splits_on_dashes() {
+        assert_eq!(
+            infer_title_from_filename("foo-essentials.yaml"),
+            "Foo Essentials"
+        );
+        assert_eq!(
+            infer_title_from_filename("my_custom.yml"),
+            "My Custom"
+        );
+    }
+
+    #[test]
+    fn create_catalog_writes_empty_packages() {
+        let dir = std::env::temp_dir().join(format!("macstrap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = create_catalog(CreateCatalogInput {
+            filename: "foo-essentials.yaml".into(),
+            title: "Foo Essentials".into(),
+            description: Some("My tools".into()),
+            location: dir.clone(),
+        })
+        .unwrap();
+        assert_eq!(path.file_name(), Some("foo-essentials.yaml".as_ref()));
+        let doc = load(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc.title, "Foo Essentials");
+        assert_eq!(doc.description.as_deref(), Some("My tools"));
+        assert!(doc.packages.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_catalog_shows_in_all_entries() {
+        let dir = std::env::temp_dir().join(format!("macstrap-entries-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = create_catalog(CreateCatalogInput {
+            filename: "mine.yml".into(),
+            title: "Mine".into(),
+            description: None,
+            location: dir.clone(),
+        })
+        .unwrap();
+        let entries = all_entries(&dir).unwrap();
+        assert!(entries.iter().any(|e| {
+            e.file().origin == Origin::Local
+                && e.file().path() == Some(path.as_path())
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

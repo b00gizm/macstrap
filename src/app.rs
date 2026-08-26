@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout};
@@ -11,18 +11,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::brewfile;
-use crate::catalog::{self, CatalogId, Desired, Kind, Observed, Package, Selection};
+use crate::catalog::{self, CatalogEntry, CatalogId, CreateCatalogInput, Desired, Kind, Observed, Package, Selection};
 use crate::ensure::{self, Error, Host, Outcome};
 
 #[derive(Debug, Parser)]
 #[command(name = env!("CARGO_PKG_NAME"), version, about = env!("CARGO_PKG_DESCRIPTION"))]
 pub struct Opts {
+    #[command(subcommand)]
+    pub command: Option<Command>,
     #[arg(long)]
     pub yes: bool,
     #[arg(long)]
     pub brewfile: Option<PathBuf>,
     #[arg(long)]
     pub essentials_only: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Manage catalogs
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CatalogCommand {
+    /// Create a custom catalog file
+    Create,
 }
 
 enum Page {
@@ -41,6 +58,7 @@ enum PickAction {
 enum CatalogsAction {
     Continue,
     Done,
+    Create,
     Abort,
 }
 
@@ -52,6 +70,8 @@ pub struct CatalogList {
     pub desired: Desired,
     pub cursor: usize,
     pub catalog_cursor: usize,
+    pub catalog_entries: Vec<CatalogEntry>,
+    pub config_dir: PathBuf,
     pub facts: HashMap<catalog::PkgId, catalog::BrewFacts>,
     pub filter: String,
     pub filtering: bool,
@@ -152,21 +172,33 @@ impl CatalogList {
         self.reload();
     }
 
+    pub fn refresh_catalog_entries(&mut self) -> Result<(), Error> {
+        self.catalog_entries = catalog::all_entries(&self.config_dir).map_err(Error::Message)?;
+        let len = self.catalog_entries.len();
+        if len == 0 {
+            self.catalog_cursor = 0;
+        } else {
+            self.catalog_cursor = self.catalog_cursor.min(len - 1);
+        }
+        Ok(())
+    }
+
     pub fn toggle_catalog(&mut self) {
-        let Some(file) = catalog::files().get(self.catalog_cursor) else {
+        let Some(entry) = self.catalog_entries.get(self.catalog_cursor) else {
             return;
         };
+        let file = entry.file();
         if file.required {
             return;
         }
         if !self.loaded.remove(&file.id) {
-            self.loaded.insert(file.id);
+            self.loaded.insert(file.id.clone());
         }
         self.reload();
     }
 
     fn move_catalog_cursor(&mut self, delta: isize) {
-        let len = catalog::files().len();
+        let len = self.catalog_entries.len();
         if len == 0 {
             self.catalog_cursor = 0;
             return;
@@ -182,6 +214,7 @@ impl CatalogList {
                 CatalogsAction::Abort
             }
             KeyCode::Char('c') => CatalogsAction::Done,
+            KeyCode::Char('n') => CatalogsAction::Create,
             KeyCode::Char('q') => CatalogsAction::Abort,
             KeyCode::Char(' ') => {
                 self.toggle_catalog();
@@ -265,6 +298,15 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         return Err(Error::Message("This tool runs on macOS only.".into()));
     }
 
+    if let Some(Command::Catalog {
+        action: CatalogCommand::Create,
+    }) = opts.command
+    {
+        let path = run_catalog_create_interactive()?;
+        println!("Created {}", path.display());
+        return Ok(0);
+    }
+
     println!("Essentials");
     let report = ensure::ensure_essentials(host);
     ensure::print_outcome("CLT", report.clt);
@@ -307,6 +349,7 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
     let facts = host.brew_facts(&universe)?;
     catalog::apply_facts(&mut merged.packages, &facts);
 
+    let config_dir = catalog::default_config_dir();
     let mut list = CatalogList {
         packages: merged.packages,
         selection: merged.selection,
@@ -315,6 +358,8 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         desired,
         cursor: 0,
         catalog_cursor: 0,
+        catalog_entries: catalog::all_entries(&config_dir).map_err(Error::Message)?,
+        config_dir,
         facts,
         filter: String::new(),
         filtering: false,
@@ -472,6 +517,18 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
             Page::Catalogs => match list.handle_catalog_key(key) {
                 CatalogsAction::Continue => {}
                 CatalogsAction::Done => page = Page::Pick,
+                CatalogsAction::Create => {
+                    ratatui::restore();
+                    match run_catalog_create_interactive() {
+                        Ok(path) => {
+                            list.loaded.insert(CatalogId::Local(path));
+                            list.refresh_catalog_entries()?;
+                            list.reload();
+                        }
+                        Err(err) => eprintln!("{err}"),
+                    }
+                    *terminal = ratatui::init();
+                }
                 CatalogsAction::Abort => return Ok(false),
             },
             Page::Confirm => match key.code {
@@ -552,10 +609,12 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
     let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
     let inner = areas[0].width.saturating_sub(2) as usize;
     let desc_w = inner.saturating_sub(44);
-    let items: Vec<ListItem> = catalog::files()
+    let items: Vec<ListItem> = list
+        .catalog_entries
         .iter()
         .enumerate()
-        .map(|(i, file)| {
+        .map(|(i, entry)| {
+            let file = entry.file();
             let checked = list.loaded.contains(&file.id) || file.required;
             let mark = if checked { "[x]" } else { "[ ]" };
             let extra = if file.required { "always on" } else { "" };
@@ -577,7 +636,48 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
         .collect();
     let widget = List::new(items).block(Block::default().borders(Borders::ALL).title("Catalogs"));
     frame.render_widget(widget, areas[0]);
-    frame.render_widget(Paragraph::new("space load/unload  enter back"), areas[1]);
+    frame.render_widget(Paragraph::new("space load/unload  n new  enter back"), areas[1]);
+}
+
+fn run_catalog_create_interactive() -> Result<PathBuf, Error> {
+    let default_dir = catalog::default_config_dir();
+    let filename = prompt_line("File name", None)?;
+    if filename.trim().is_empty() {
+        return Err(Error::Message("file name is required".into()));
+    }
+    let default_title = catalog::infer_title_from_filename(&filename);
+    let title = prompt_line("Name", Some(&default_title))?;
+    let description = prompt_line("Description", Some(""))?;
+    let description = if description.trim().is_empty() {
+        None
+    } else {
+        Some(description)
+    };
+    let location = prompt_line("Location", Some(&default_dir.display().to_string()))?;
+    let location = PathBuf::from(location);
+    catalog::create_catalog(CreateCatalogInput {
+        filename,
+        title,
+        description,
+        location,
+    })
+    .map_err(Error::Message)
+}
+
+fn prompt_line(label: &str, default: Option<&str>) -> Result<String, Error> {
+    use std::io::Write;
+    match default {
+        Some(d) => print!("{label} [{d}]: "),
+        None => print!("{label}: "),
+    }
+    io::stdout().flush().map_err(Error::from)?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).map_err(Error::from)?;
+    let line = line.trim_end_matches(['\n', '\r']).to_string();
+    if line.is_empty() {
+        return Ok(default.unwrap_or("").to_string());
+    }
+    Ok(line)
 }
 
 fn draw_confirm(frame: &mut ratatui::Frame, list: &CatalogList) {
@@ -616,6 +716,7 @@ mod tests {
         selection.insert(packages[0].id.clone(), true);
         selection.insert(packages[1].id.clone(), false);
         selection.insert(packages[2].id.clone(), false);
+        let config_dir = catalog::default_config_dir();
         CatalogList {
             packages,
             selection,
@@ -624,6 +725,8 @@ mod tests {
             desired: Desired::new(),
             cursor: 0,
             catalog_cursor: 0,
+            catalog_entries: catalog::all_entries(&config_dir).unwrap(),
+            config_dir,
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
@@ -658,6 +761,7 @@ mod tests {
         let loaded = catalog::default_loaded();
         let catalog = catalog::compose(&loaded).unwrap();
         let merged = catalog::merge(&catalog, &Desired::new());
+        let config_dir = catalog::default_config_dir();
         CatalogList {
             packages: merged.packages,
             selection: merged.selection,
@@ -666,6 +770,8 @@ mod tests {
             desired: Desired::new(),
             cursor: 0,
             catalog_cursor: 0,
+            catalog_entries: catalog::all_entries(&config_dir).unwrap(),
+            config_dir,
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
@@ -674,7 +780,12 @@ mod tests {
     }
 
     fn catalog_index(id: CatalogId) -> usize {
-        catalog::files().iter().position(|f| f.id == id).unwrap()
+        let config_dir = catalog::default_config_dir();
+        catalog::all_entries(&config_dir)
+            .unwrap()
+            .iter()
+            .position(|e| e.file().id == id)
+            .unwrap()
     }
 
     #[test]
@@ -832,15 +943,15 @@ mod tests {
     #[test]
     fn toggle_show_all_installed_adds_unknown_formula() {
         let mut l = live_list();
-        let wget = PkgId::new(Kind::Formula, "wget", None);
-        l.observed.insert(wget.clone());
-        assert!(!l.packages.iter().any(|p| p.name == "wget"));
+        let unknown = PkgId::new(Kind::Formula, "macstrap-unknown-formula", None);
+        l.observed.insert(unknown.clone());
+        assert!(!l.packages.iter().any(|p| p.name == "macstrap-unknown-formula"));
         l.toggle_show_all_installed();
         assert!(l.show_all_installed);
-        assert!(l.packages.iter().any(|p| p.name == "wget"));
+        assert!(l.packages.iter().any(|p| p.name == "macstrap-unknown-formula"));
         l.toggle_show_all_installed();
         assert!(!l.show_all_installed);
-        assert!(!l.packages.iter().any(|p| p.name == "wget"));
+        assert!(!l.packages.iter().any(|p| p.name == "macstrap-unknown-formula"));
     }
 
     #[test]
