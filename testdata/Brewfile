@@ -1,16 +1,9 @@
-# Essentials
 brew "coreutils"
 brew "git"
 brew "mas"
-
-# Casks
 cask "visual-studio-code"
 cask "orbstack"
-
-# MAS
 mas "Fantastical", id: 975937182
 mas "Yoink", id: 457622435
-
-# Ignored in v1
 tap "homebrew/core"
 vscode "editorconfig.editorconfig"
