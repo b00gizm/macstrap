@@ -6,12 +6,15 @@ use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::brewfile;
-use crate::catalog::{self, CatalogEntry, CatalogId, CreateCatalogInput, Desired, Kind, Observed, Package, Selection};
+use crate::catalog::{
+    self, CatalogEntry, CatalogId, CreateCatalogInput, Desired, Kind, Observed, Package, PkgId,
+    Selection,
+};
 use crate::ensure::{self, Error, Host, Outcome};
 
 #[derive(Debug, Parser)]
@@ -76,6 +79,7 @@ pub struct CatalogList {
     pub filter: String,
     pub filtering: bool,
     pub show_all_installed: bool,
+    pub catalog_pkg_ids: HashSet<PkgId>,
 }
 
 impl CatalogList {
@@ -141,6 +145,7 @@ impl CatalogList {
 
     pub fn reload(&mut self) {
         let catalog = catalog::compose(&self.loaded).expect("embedded catalogs parse");
+        self.catalog_pkg_ids = catalog.iter().map(|p| p.id.clone()).collect();
         let universe = catalog::compose_all().expect("embedded catalogs parse");
         let mut merged = catalog::merge(&catalog, &self.desired);
         catalog::include_observed(
@@ -172,6 +177,10 @@ impl CatalogList {
         self.reload();
     }
 
+    pub fn persist_catalogs(&self) -> Result<(), Error> {
+        catalog::save_persisted_catalogs(&self.config_dir, &self.loaded).map_err(Error::Message)
+    }
+
     pub fn refresh_catalog_entries(&mut self) -> Result<(), Error> {
         self.catalog_entries = catalog::all_entries(&self.config_dir).map_err(Error::Message)?;
         let len = self.catalog_entries.len();
@@ -195,6 +204,7 @@ impl CatalogList {
             self.loaded.insert(file.id.clone());
         }
         self.reload();
+        let _ = self.persist_catalogs();
     }
 
     fn move_catalog_cursor(&mut self, delta: isize) {
@@ -307,9 +317,10 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         return Ok(0);
     }
 
-    println!("Essentials");
+    ensure::print_banner();
+    ensure::print_section("Essentials");
     let report = ensure::ensure_essentials(host);
-    ensure::print_outcome("CLT", report.clt);
+    ensure::print_outcome("Command Line Tools", report.clt);
     ensure::print_outcome("Homebrew", report.brew);
     ensure::print_outcome("oh-my-zsh", report.omz);
     if matches!(report.clt, Outcome::Failed)
@@ -322,7 +333,11 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         return Ok(0);
     }
 
-    let loaded = catalog::default_loaded();
+    ensure::print_section("CLI essentials");
+    ensure::ensure_cli_essentials(host)?;
+
+    let config_dir = catalog::default_config_dir();
+    let loaded = catalog::load_persisted_catalogs(&config_dir);
     let catalog = catalog::compose(&loaded).map_err(Error::Message)?;
     let (desired, skipped) = load_brewfile(opts.brewfile.as_ref())?;
     if !skipped.is_empty() {
@@ -349,12 +364,13 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
     let facts = host.brew_facts(&universe)?;
     catalog::apply_facts(&mut merged.packages, &facts);
 
-    let config_dir = catalog::default_config_dir();
+    let catalog_pkg_ids = catalog.iter().map(|p| p.id.clone()).collect();
     let mut list = CatalogList {
         packages: merged.packages,
         selection: merged.selection,
         observed: observed.clone(),
         loaded,
+        catalog_pkg_ids,
         desired,
         cursor: 0,
         catalog_cursor: 0,
@@ -368,7 +384,7 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
     loop {
         let confirmed = pick(&mut list)?;
         if !confirmed {
-            println!("aborted");
+            ensure::print_goodbye();
             return Ok(1);
         }
         if let Err(err) = apply(host, &list.packages, &list.selection, &list.observed) {
@@ -424,7 +440,7 @@ fn apply(
     selection: &Selection,
     observed: &Observed,
 ) -> Result<i32, Error> {
-    println!("Apply");
+    ensure::print_section("Apply");
     let mut failed = 0;
     let mut seen = observed.clone();
     for pkg in catalog::pending_uninstall(packages, selection, &seen) {
@@ -516,7 +532,12 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
             },
             Page::Catalogs => match list.handle_catalog_key(key) {
                 CatalogsAction::Continue => {}
-                CatalogsAction::Done => page = Page::Pick,
+                CatalogsAction::Done => {
+                    if let Err(err) = list.persist_catalogs() {
+                        eprintln!("{err}");
+                    }
+                    page = Page::Pick;
+                }
                 CatalogsAction::Create => {
                     ratatui::restore();
                     match run_catalog_create_interactive() {
@@ -524,6 +545,7 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
                             list.loaded.insert(CatalogId::Local(path));
                             list.refresh_catalog_entries()?;
                             list.reload();
+                            let _ = list.persist_catalogs();
                         }
                         Err(err) => eprintln!("{err}"),
                     }
@@ -560,6 +582,21 @@ fn cell(s: &str, width: usize) -> String {
     out
 }
 
+fn package_row_style(pkg: &Package, list: &CatalogList, cursor: bool) -> Style {
+    let mut style = Style::default();
+    if list.observed.contains(&pkg.id) {
+        style = if list.catalog_pkg_ids.contains(&pkg.id) {
+            style.fg(Color::Green)
+        } else {
+            style.fg(Color::DarkGray)
+        };
+    }
+    if cursor {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
 fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
     let inner = areas[0].width.saturating_sub(2) as usize;
@@ -572,11 +609,7 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
             let pkg = &list.packages[i];
             let checked = list.selection.get(&pkg.id).copied().unwrap_or(false);
             let mark = if checked { "[x]" } else { "[ ]" };
-            let style = if vis_i == list.cursor {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
+            let style = package_row_style(pkg, list, vis_i == list.cursor);
             ListItem::new(Line::from(vec![Span::raw(format!(
                 "{mark} {} {} {} {} {}",
                 cell(&pkg.title, 24),
@@ -717,11 +750,18 @@ mod tests {
         selection.insert(packages[1].id.clone(), false);
         selection.insert(packages[2].id.clone(), false);
         let config_dir = catalog::default_config_dir();
+        let loaded = catalog::default_loaded();
+        let catalog_pkg_ids = catalog::compose(&loaded)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
         CatalogList {
             packages,
             selection,
             observed: Observed::new(),
-            loaded: catalog::default_loaded(),
+            loaded,
+            catalog_pkg_ids,
             desired: Desired::new(),
             cursor: 0,
             catalog_cursor: 0,
@@ -762,11 +802,13 @@ mod tests {
         let catalog = catalog::compose(&loaded).unwrap();
         let merged = catalog::merge(&catalog, &Desired::new());
         let config_dir = catalog::default_config_dir();
+        let catalog_pkg_ids = catalog.iter().map(|p| p.id.clone()).collect();
         CatalogList {
             packages: merged.packages,
             selection: merged.selection,
             observed: Observed::new(),
             loaded,
+            catalog_pkg_ids,
             desired: Desired::new(),
             cursor: 0,
             catalog_cursor: 0,
@@ -986,6 +1028,43 @@ mod tests {
                 "Brewfile id not preselected: {id:?}"
             );
         }
+    }
+
+    #[test]
+    fn package_row_style_colors_by_install_state() {
+        let mut l = live_list();
+        let git = PkgId::new(Kind::Formula, "git", None);
+        let node = PkgId::new(Kind::Formula, "node", None);
+        l.observed.insert(git.clone());
+        l.observed.insert(node.clone());
+        l.reload();
+        assert_eq!(
+            package_row_style(
+                l.packages.iter().find(|p| p.id == git).unwrap(),
+                &l,
+                false
+            )
+            .fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            package_row_style(
+                l.packages.iter().find(|p| p.id == node).unwrap(),
+                &l,
+                false
+            )
+            .fg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            package_row_style(
+                l.packages.iter().find(|p| p.name == "jq").unwrap(),
+                &l,
+                false
+            )
+            .fg,
+            None
+        );
     }
 
     #[test]
