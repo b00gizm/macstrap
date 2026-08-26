@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use std::collections::HashMap;
 
-use crate::catalog::{self, Kind, Observed, Package, PkgId};
+use crate::catalog::{self, BrewFacts, Kind, Observed, Package, PkgId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
@@ -59,7 +59,7 @@ pub trait Host {
     fn install_omz(&self) -> Result<(), Error>;
     fn installed(&self) -> Result<Observed, Error>;
     fn install(&self, pkg: &Package) -> Result<(), Error>;
-    fn descriptions(&self, packages: &[Package]) -> Result<HashMap<PkgId, String>, Error>;
+    fn brew_facts(&self, packages: &[Package]) -> Result<HashMap<PkgId, BrewFacts>, Error>;
 }
 
 pub fn ensure_clt(host: &impl Host) -> Outcome {
@@ -236,12 +236,12 @@ impl Host for Live {
         }
     }
 
-    fn descriptions(&self, packages: &[Package]) -> Result<HashMap<PkgId, String>, Error> {
-        let missing: Vec<&Package> = packages
+    fn brew_facts(&self, packages: &[Package]) -> Result<HashMap<PkgId, BrewFacts>, Error> {
+        let wanted: Vec<&Package> = packages
             .iter()
-            .filter(|p| catalog::needs_brew_desc(p))
+            .filter(|p| catalog::needs_brew_facts(p))
             .collect();
-        if missing.is_empty() {
+        if wanted.is_empty() {
             return Ok(HashMap::new());
         }
         let Some(brew) = find_brew() else {
@@ -250,7 +250,7 @@ impl Host for Live {
         let output = Command::new(brew)
             .arg("info")
             .arg("--json=v2")
-            .args(missing.iter().map(|p| p.name.as_str()))
+            .args(wanted.iter().map(|p| p.name.as_str()))
             .output()?;
         if !output.status.success() {
             return Ok(HashMap::new());
@@ -271,27 +271,61 @@ struct BrewInfoJson {
 struct BrewFormula {
     name: String,
     desc: Option<String>,
+    #[serde(default)]
+    versions: BrewVersions,
+    #[serde(default)]
+    installed: Vec<BrewInstalled>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct BrewVersions {
+    stable: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BrewInstalled {
+    version: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct BrewCask {
     token: String,
     desc: Option<String>,
+    version: Option<String>,
+    installed: Option<String>,
 }
 
-fn parse_brew_info(json: &str) -> Result<HashMap<PkgId, String>, Error> {
+fn nonempty(s: Option<String>) -> Option<String> {
+    s.filter(|v| !v.is_empty())
+}
+
+fn parse_brew_info(json: &str) -> Result<HashMap<PkgId, BrewFacts>, Error> {
     let parsed: BrewInfoJson =
         serde_json::from_str(json).map_err(|e| Error::Message(format!("brew info: {e}")))?;
     let mut out = HashMap::new();
     for f in parsed.formulae {
-        if let Some(desc) = f.desc.filter(|s| !s.is_empty()) {
-            out.insert(PkgId::new(Kind::Formula, &f.name, None), desc);
-        }
+        out.insert(
+            PkgId::new(Kind::Formula, &f.name, None),
+            BrewFacts {
+                description: nonempty(f.desc),
+                available: nonempty(f.versions.stable),
+                installed: f
+                    .installed
+                    .into_iter()
+                    .rev()
+                    .find_map(|i| nonempty(i.version)),
+            },
+        );
     }
     for c in parsed.casks {
-        if let Some(desc) = c.desc.filter(|s| !s.is_empty()) {
-            out.insert(PkgId::new(Kind::Cask, &c.token, None), desc);
-        }
+        out.insert(
+            PkgId::new(Kind::Cask, &c.token, None),
+            BrewFacts {
+                description: nonempty(c.desc),
+                available: nonempty(c.version),
+                installed: nonempty(c.installed),
+            },
+        );
     }
     Ok(out)
 }
@@ -387,7 +421,7 @@ pub struct FakeHost {
     pub omz_calls: Cell<u32>,
     pub installs: RefCell<Vec<PkgId>>,
     pub fail: Cell<bool>,
-    pub descriptions: RefCell<HashMap<PkgId, String>>,
+    pub facts: RefCell<HashMap<PkgId, BrewFacts>>,
 }
 
 #[cfg(test)]
@@ -403,7 +437,7 @@ impl Default for FakeHost {
             omz_calls: Cell::new(0),
             installs: RefCell::new(Vec::new()),
             fail: Cell::new(false),
-            descriptions: RefCell::new(HashMap::new()),
+            facts: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -464,11 +498,11 @@ impl Host for FakeHost {
         Ok(())
     }
 
-    fn descriptions(&self, packages: &[Package]) -> Result<HashMap<PkgId, String>, Error> {
-        let stored = self.descriptions.borrow();
+    fn brew_facts(&self, packages: &[Package]) -> Result<HashMap<PkgId, BrewFacts>, Error> {
+        let stored = self.facts.borrow();
         Ok(packages
             .iter()
-            .filter(|p| catalog::needs_brew_desc(p))
+            .filter(|p| catalog::needs_brew_facts(p))
             .filter_map(|p| stored.get(&p.id).cloned().map(|d| (p.id.clone(), d)))
             .collect())
     }
@@ -520,6 +554,8 @@ mod tests {
             title: "Git".into(),
             category: "CLI".into(),
             description: None,
+            available: None,
+            installed_version: None,
         };
         host.installed.borrow_mut().insert(pkg.id.clone());
         assert_eq!(
@@ -540,6 +576,8 @@ mod tests {
             title: "Git".into(),
             category: "CLI".into(),
             description: None,
+            available: None,
+            installed_version: None,
         };
         let empty = Observed::new();
         assert_eq!(ensure_package(&host, &pkg, &empty), Outcome::Applied);
@@ -551,22 +589,35 @@ mod tests {
     #[test]
     fn parse_brew_info_maps_formula_and_cask() {
         let json = r#"{
-            "formulae": [{"name": "git", "desc": "Distributed revision control system"}],
-            "casks": [{"token": "visual-studio-code", "desc": "Open-source code editor"}]
+            "formulae": [{
+                "name": "git",
+                "desc": "Distributed revision control system",
+                "versions": {"stable": "2.55.0"},
+                "installed": [{"version": "2.53.0_1"}]
+            }],
+            "casks": [{
+                "token": "visual-studio-code",
+                "desc": "Open-source code editor",
+                "version": "1.135.0",
+                "installed": "1.87.1"
+            }]
         }"#;
         let map = parse_brew_info(json).unwrap();
+        let git = &map[&PkgId::new(Kind::Formula, "git", None)];
         assert_eq!(
-            map[&PkgId::new(Kind::Formula, "git", None)],
-            "Distributed revision control system"
+            git.description.as_deref(),
+            Some("Distributed revision control system")
         );
-        assert_eq!(
-            map[&PkgId::new(Kind::Cask, "visual-studio-code", None)],
-            "Open-source code editor"
-        );
+        assert_eq!(git.available.as_deref(), Some("2.55.0"));
+        assert_eq!(git.installed.as_deref(), Some("2.53.0_1"));
+        let cask = &map[&PkgId::new(Kind::Cask, "visual-studio-code", None)];
+        assert_eq!(cask.description.as_deref(), Some("Open-source code editor"));
+        assert_eq!(cask.available.as_deref(), Some("1.135.0"));
+        assert_eq!(cask.installed.as_deref(), Some("1.87.1"));
     }
 
     #[test]
-    fn fake_descriptions_skip_yaml_and_mas() {
+    fn fake_brew_facts_skip_mas() {
         let host = FakeHost::default();
         let git = Package {
             id: PkgId::new(Kind::Formula, "git", None),
@@ -576,24 +627,16 @@ mod tests {
             title: "Git".into(),
             category: "CLI".into(),
             description: Some("yaml".into()),
+            available: None,
+            installed_version: None,
         };
-        let jq = Package {
-            id: PkgId::new(Kind::Formula, "jq", None),
-            kind: Kind::Formula,
-            name: "jq".into(),
-            mas_id: None,
-            title: "jq".into(),
-            category: "CLI".into(),
-            description: None,
+        let fact = BrewFacts {
+            description: Some("brew git".into()),
+            available: Some("2.55.0".into()),
+            installed: Some("2.53.0_1".into()),
         };
-        host.descriptions
-            .borrow_mut()
-            .insert(jq.id.clone(), "jq desc".into());
-        host.descriptions
-            .borrow_mut()
-            .insert(git.id.clone(), "brew git".into());
-        let map = host.descriptions(&[git, jq]).unwrap();
-        assert!(!map.contains_key(&PkgId::new(Kind::Formula, "git", None)));
-        assert_eq!(map[&PkgId::new(Kind::Formula, "jq", None)], "jq desc");
+        host.facts.borrow_mut().insert(git.id.clone(), fact.clone());
+        let map = host.brew_facts(&[git]).unwrap();
+        assert_eq!(map[&PkgId::new(Kind::Formula, "git", None)], fact);
     }
 }

@@ -133,6 +133,15 @@ pub struct Package {
     pub title: String,
     pub category: String,
     pub description: Option<String>,
+    pub available: Option<String>,
+    pub installed_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BrewFacts {
+    pub description: Option<String>,
+    pub available: Option<String>,
+    pub installed: Option<String>,
 }
 
 pub type Catalog = Vec<Package>;
@@ -163,6 +172,8 @@ impl From<CatalogRow> for Package {
             title: row.title,
             category: row.category,
             description: row.description,
+            available: None,
+            installed_version: None,
         }
     }
 }
@@ -218,17 +229,23 @@ pub fn merge(catalog: &[Package], desired: &Desired) -> Merge {
     }
 }
 
-pub fn needs_brew_desc(pkg: &Package) -> bool {
-    pkg.description.is_none() && matches!(pkg.kind, Kind::Formula | Kind::Cask)
+pub fn needs_brew_facts(pkg: &Package) -> bool {
+    matches!(pkg.kind, Kind::Formula | Kind::Cask)
 }
 
-pub fn apply_descriptions(packages: &mut [Package], descs: &HashMap<PkgId, String>) {
+pub fn apply_facts(packages: &mut [Package], facts: &HashMap<PkgId, BrewFacts>) {
     for pkg in packages {
-        if needs_brew_desc(pkg)
-            && let Some(desc) = descs.get(&pkg.id)
-        {
-            pkg.description = Some(desc.clone());
+        if !needs_brew_facts(pkg) {
+            continue;
         }
+        let Some(fact) = facts.get(&pkg.id) else {
+            continue;
+        };
+        if pkg.description.is_none() {
+            pkg.description = fact.description.clone();
+        }
+        pkg.available = fact.available.clone();
+        pkg.installed_version = fact.installed.clone();
     }
 }
 
@@ -260,6 +277,8 @@ mod tests {
             title: name.to_string(),
             category: "Test".to_string(),
             description: None,
+            available: None,
+            installed_version: None,
         }
     }
 
@@ -318,27 +337,41 @@ mod tests {
     }
 
     #[test]
-    fn apply_descriptions_fills_gaps_and_keeps_yaml() {
+    fn apply_facts_fills_gaps_keeps_yaml_and_sets_versions() {
         let mut packages = vec![
             pkg(Kind::Formula, "git", None),
             pkg(Kind::Formula, "jq", None),
             pkg(Kind::Mas, "Yoink", Some(457622435)),
         ];
         packages[0].description = Some("from yaml".into());
-        let mut descs = HashMap::new();
-        descs.insert(PkgId::new(Kind::Formula, "git", None), "from brew".into());
-        descs.insert(PkgId::new(Kind::Formula, "jq", None), "jq desc".into());
-        descs.insert(
-            PkgId::new(Kind::Mas, "Yoink", Some(457622435)),
-            "should not apply".into(),
+        let mut facts = HashMap::new();
+        facts.insert(
+            PkgId::new(Kind::Formula, "git", None),
+            BrewFacts {
+                description: Some("from brew".into()),
+                available: Some("2.55.0".into()),
+                installed: Some("2.53.0_1".into()),
+            },
         );
-        apply_descriptions(&mut packages, &descs);
+        facts.insert(
+            PkgId::new(Kind::Formula, "jq", None),
+            BrewFacts {
+                description: Some("jq desc".into()),
+                available: Some("1.8.2".into()),
+                installed: None,
+            },
+        );
+        apply_facts(&mut packages, &facts);
         assert_eq!(packages[0].description.as_deref(), Some("from yaml"));
+        assert_eq!(packages[0].available.as_deref(), Some("2.55.0"));
+        assert_eq!(packages[0].installed_version.as_deref(), Some("2.53.0_1"));
         assert_eq!(packages[1].description.as_deref(), Some("jq desc"));
+        assert_eq!(packages[1].available.as_deref(), Some("1.8.2"));
+        assert_eq!(packages[1].installed_version, None);
         assert_eq!(packages[2].description, None);
-        assert!(needs_brew_desc(&pkg(Kind::Formula, "fd", None)));
-        assert!(!needs_brew_desc(&packages[0]));
-        assert!(!needs_brew_desc(&packages[2]));
+        assert_eq!(packages[2].available, None);
+        assert!(needs_brew_facts(&pkg(Kind::Formula, "fd", None)));
+        assert!(!needs_brew_facts(&packages[2]));
     }
 
     #[test]

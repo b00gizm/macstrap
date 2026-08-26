@@ -42,6 +42,8 @@ fn package(kind: Kind, name: &str, mas_id: Option<u64>, title: &str) -> Package 
         title: title.to_string(),
         category: "Brewfile".to_string(),
         description: None,
+        available: None,
+        installed_version: None,
     }
 }
 

@@ -36,7 +36,7 @@ The picker uses `space` to toggle, `a` for all, `n` for none, `/` to filter, `c`
 
 `c` opens the catalog list. Each row shows an origin and a description. Bundled files are `builtin`. `cli-essentials.yml` is always loaded. Space loads or unloads the others. The tool list updates as soon as a file is loaded or unloaded.
 
-Descriptions are optional. An empty description stays blank. A formula or cask without one uses `brew info`.
+Descriptions are optional. An empty description stays blank. A formula or cask without one uses `brew info`. That same call fills the installed and available version columns.
 
 Deselect does not uninstall. The tool does not change your login shell unless it is still bash.
 

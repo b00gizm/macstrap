@@ -52,7 +52,7 @@ pub struct CatalogList {
     pub desired: Desired,
     pub cursor: usize,
     pub catalog_cursor: usize,
-    pub descriptions: HashMap<catalog::PkgId, String>,
+    pub facts: HashMap<catalog::PkgId, catalog::BrewFacts>,
     pub filter: String,
     pub filtering: bool,
 }
@@ -124,7 +124,7 @@ impl CatalogList {
                 self.selection.insert(id, on);
             }
         }
-        catalog::apply_descriptions(&mut self.packages, &self.descriptions);
+        catalog::apply_facts(&mut self.packages, &self.facts);
         let vis = self.visible().len();
         self.cursor = if vis == 0 {
             0
@@ -285,8 +285,8 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
             universe.push(pkg.clone());
         }
     }
-    let descriptions = host.descriptions(&universe)?;
-    catalog::apply_descriptions(&mut merged.packages, &descriptions);
+    let facts = host.brew_facts(&universe)?;
+    catalog::apply_facts(&mut merged.packages, &facts);
 
     let mut list = CatalogList {
         packages: merged.packages,
@@ -296,7 +296,7 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         desired,
         cursor: 0,
         catalog_cursor: 0,
-        descriptions,
+        facts,
         filter: String::new(),
         filtering: false,
     };
@@ -362,6 +362,8 @@ fn apply(
             title: "mas".into(),
             category: "CLI".into(),
             description: None,
+            available: None,
+            installed_version: None,
         };
         let mas = packages.iter().find(|p| p.id == mas_id).unwrap_or(&owned);
         let outcome = ensure::ensure_package(host, mas, &seen);
@@ -459,7 +461,7 @@ fn cell(s: &str, width: usize) -> String {
 fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
     let inner = areas[0].width.saturating_sub(2) as usize;
-    let desc_w = inner.saturating_sub(52);
+    let desc_w = inner.saturating_sub(72);
     let visible = list.visible();
     let items: Vec<ListItem> = visible
         .iter()
@@ -468,22 +470,18 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
             let pkg = &list.packages[i];
             let checked = list.selection.get(&pkg.id).copied().unwrap_or(false);
             let mark = if checked { "[x]" } else { "[ ]" };
-            let installed = if list.observed.contains(&pkg.id) {
-                "installed"
-            } else {
-                ""
-            };
             let style = if vis_i == list.cursor {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
             ListItem::new(Line::from(vec![Span::raw(format!(
-                "{mark} {} {} {} {}",
+                "{mark} {} {} {} {} {}",
                 cell(&pkg.title, 24),
                 cell(&pkg.category, 12),
                 cell(pkg.description.as_deref().unwrap_or(""), desc_w),
-                cell(installed, 9)
+                cell(pkg.installed_version.as_deref().unwrap_or(""), 14),
+                cell(pkg.available.as_deref().unwrap_or(""), 14)
             ))]))
             .style(style)
         })
@@ -555,6 +553,8 @@ mod tests {
             title: name.into(),
             category: "CLI".into(),
             description: None,
+            available: None,
+            installed_version: None,
         }
     }
 
@@ -572,7 +572,7 @@ mod tests {
             desired: Desired::new(),
             cursor: 0,
             catalog_cursor: 0,
-            descriptions: HashMap::new(),
+            facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
         }
@@ -613,7 +613,7 @@ mod tests {
             desired: Desired::new(),
             cursor: 0,
             catalog_cursor: 0,
-            descriptions: HashMap::new(),
+            facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
         }
@@ -663,16 +663,22 @@ mod tests {
     }
 
     #[test]
-    fn reload_applies_cached_brew_descriptions() {
+    fn reload_applies_cached_brew_facts() {
         let mut l = live_list();
-        l.descriptions.insert(
+        l.facts.insert(
             PkgId::new(Kind::Formula, "node", None),
-            "JavaScript runtime".into(),
+            catalog::BrewFacts {
+                description: Some("JavaScript runtime".into()),
+                available: Some("24.0.0".into()),
+                installed: Some("22.0.0".into()),
+            },
         );
         l.catalog_cursor = catalog_index(CatalogId::NodeEssentials);
         l.toggle_catalog();
         let node = l.packages.iter().find(|p| p.name == "node").unwrap();
         assert_eq!(node.description.as_deref(), Some("JavaScript runtime"));
+        assert_eq!(node.available.as_deref(), Some("24.0.0"));
+        assert_eq!(node.installed_version.as_deref(), Some("22.0.0"));
     }
 
     #[test]
