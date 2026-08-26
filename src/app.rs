@@ -515,11 +515,12 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
             } else {
                 Style::default()
             };
+            let doc = file.doc().expect("embedded catalogs parse");
             ListItem::new(Line::from(vec![Span::raw(format!(
                 "{mark} {} {} {} {}",
-                cell(file.title, 20),
+                cell(&doc.title, 20),
                 cell(file.origin.label(), 8),
-                cell(file.description.unwrap_or(""), desc_w),
+                cell(doc.description.as_deref().unwrap_or(""), desc_w),
                 cell(extra, 9)
             ))]))
             .style(style)

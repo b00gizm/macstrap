@@ -1,16 +1,19 @@
-- name: node
-  kind: formula
-  title: Node.js
-  category: Languages
-- name: pnpm
-  kind: formula
-  title: pnpm
-  category: Languages
-- name: yarn
-  kind: formula
-  title: Yarn
-  category: Languages
-- name: bun
-  kind: formula
-  title: Bun
-  category: Languages
+title: Node full
+description: Opinionated Node.js setup
+packages:
+  - name: node
+    kind: formula
+    title: Node.js
+    category: Languages
+  - name: pnpm
+    kind: formula
+    title: pnpm
+    category: Languages
+  - name: yarn
+    kind: formula
+    title: Yarn
+    category: Languages
+  - name: bun
+    kind: formula
+    title: Bun
+    category: Languages

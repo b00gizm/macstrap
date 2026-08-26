@@ -1,20 +1,23 @@
-- name: git
-  kind: formula
-  title: Git
-  category: CLI
-- name: gh
-  kind: formula
-  title: GitHub CLI
-  category: CLI
-- name: fd
-  kind: formula
-  title: fd
-  category: CLI
-- name: fzf
-  kind: formula
-  title: fzf
-  category: CLI
-- name: jq
-  kind: formula
-  title: jq
-  category: CLI
+title: CLI essentials
+description: Absolute must-haves
+packages:
+  - name: git
+    kind: formula
+    title: Git
+    category: CLI
+  - name: gh
+    kind: formula
+    title: GitHub CLI
+    category: CLI
+  - name: fd
+    kind: formula
+    title: fd
+    category: CLI
+  - name: fzf
+    kind: formula
+    title: fzf
+    category: CLI
+  - name: jq
+    kind: formula
+    title: jq
+    category: CLI

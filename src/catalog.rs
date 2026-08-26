@@ -36,67 +36,57 @@ pub enum CatalogId {
 
 pub struct CatalogFile {
     pub id: CatalogId,
-    pub title: &'static str,
     pub origin: Origin,
-    pub description: Option<&'static str>,
     pub required: bool,
     yaml: &'static str,
+}
+
+impl CatalogFile {
+    pub fn doc(&self) -> Result<CatalogDoc, String> {
+        load(self.yaml)
+    }
 }
 
 const FILES: &[CatalogFile] = &[
     CatalogFile {
         id: CatalogId::CliEssentials,
-        title: "CLI essentials",
         origin: Origin::Builtin,
-        description: Some("Absolute must-haves"),
         required: true,
         yaml: include_str!("../catalogs/cli-essentials.yml"),
     },
     CatalogFile {
         id: CatalogId::NodeEssentials,
-        title: "Node essentials",
         origin: Origin::Builtin,
-        description: Some("Minimal Node.js setup"),
         required: false,
         yaml: include_str!("../catalogs/node-essentials.yml"),
     },
     CatalogFile {
         id: CatalogId::NodeFull,
-        title: "Node full",
         origin: Origin::Builtin,
-        description: Some("Opinionated Node.js setup"),
         required: false,
         yaml: include_str!("../catalogs/node-full.yml"),
     },
     CatalogFile {
         id: CatalogId::PythonEssentials,
-        title: "Python essentials",
         origin: Origin::Builtin,
-        description: Some("Minimal Python setup"),
         required: false,
         yaml: include_str!("../catalogs/python-essentials.yml"),
     },
     CatalogFile {
         id: CatalogId::PythonFull,
-        title: "Python full",
         origin: Origin::Builtin,
-        description: Some("Opinionated Python setup"),
         required: false,
         yaml: include_str!("../catalogs/python-full.yml"),
     },
     CatalogFile {
         id: CatalogId::RustEssentials,
-        title: "Rust essentials",
         origin: Origin::Builtin,
-        description: Some("Minimal Rust setup"),
         required: false,
         yaml: include_str!("../catalogs/rust-essentials.yml"),
     },
     CatalogFile {
         id: CatalogId::RustFull,
-        title: "Rust full",
         origin: Origin::Builtin,
-        description: Some("Opinionated Rust setup"),
         required: false,
         yaml: include_str!("../catalogs/rust-full.yml"),
     },
@@ -149,6 +139,21 @@ pub type Desired = HashMap<PkgId, Package>;
 pub type Observed = HashSet<PkgId>;
 pub type Selection = HashMap<PkgId, bool>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogDoc {
+    pub title: String,
+    pub description: Option<String>,
+    pub packages: Catalog,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogYaml {
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    packages: Vec<CatalogRow>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CatalogRow {
     kind: Kind,
@@ -178,9 +183,13 @@ impl From<CatalogRow> for Package {
     }
 }
 
-pub fn load(yaml: &str) -> Result<Catalog, String> {
-    let rows: Vec<CatalogRow> = serde_yaml::from_str(yaml).map_err(|e| format!("catalog: {e}"))?;
-    Ok(rows.into_iter().map(Package::from).collect())
+pub fn load(yaml: &str) -> Result<CatalogDoc, String> {
+    let doc: CatalogYaml = serde_yaml::from_str(yaml).map_err(|e| format!("catalog: {e}"))?;
+    Ok(CatalogDoc {
+        title: doc.title,
+        description: doc.description,
+        packages: doc.packages.into_iter().map(Package::from).collect(),
+    })
 }
 
 pub fn compose(loaded: &HashSet<CatalogId>) -> Result<Catalog, String> {
@@ -192,7 +201,7 @@ pub fn compose(loaded: &HashSet<CatalogId>) -> Result<Catalog, String> {
         if !active.contains(&file.id) {
             continue;
         }
-        for pkg in load(file.yaml)? {
+        for pkg in load(file.yaml)?.packages {
             if seen.insert(pkg.id.clone()) {
                 packages.push(pkg);
             }
@@ -315,25 +324,29 @@ mod tests {
 
     #[test]
     fn yaml_description_is_optional() {
-        let rows = load(
+        let doc = load(
             r#"
-- name: git
-  kind: formula
-  title: Git
-  category: CLI
-  description: Distributed version control
-- name: jq
-  kind: formula
-  title: jq
-  category: CLI
+title: Example
+packages:
+  - name: git
+    kind: formula
+    title: Git
+    category: CLI
+    description: Distributed version control
+  - name: jq
+    kind: formula
+    title: jq
+    category: CLI
 "#,
         )
         .unwrap();
+        assert_eq!(doc.title, "Example");
+        assert_eq!(doc.description, None);
         assert_eq!(
-            rows[0].description.as_deref(),
+            doc.packages[0].description.as_deref(),
             Some("Distributed version control")
         );
-        assert_eq!(rows[1].description, None);
+        assert_eq!(doc.packages[1].description, None);
     }
 
     #[test]
@@ -386,11 +399,12 @@ mod tests {
     #[test]
     fn each_catalog_file_parses() {
         for file in FILES {
-            let rows = load(file.yaml).unwrap();
+            let doc = file.doc().unwrap();
+            assert!(!doc.title.is_empty());
             assert!(
-                !rows.is_empty(),
+                !doc.packages.is_empty(),
                 "{} must list at least one package",
-                file.title
+                doc.title
             );
         }
     }

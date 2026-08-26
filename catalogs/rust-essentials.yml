@@ -1,4 +1,7 @@
-- name: rustup
-  kind: formula
-  title: rustup
-  category: Languages
+title: Rust essentials
+description: Minimal Rust setup
+packages:
+  - name: rustup
+    kind: formula
+    title: rustup
+    category: Languages

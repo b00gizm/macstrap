@@ -51,3 +51,5 @@ Curated lists live in `catalogs/`. `cli-essentials.yml` is always on. The others
 - `rust-essentials.yml` and `rust-full.yml`
 
 A full file is a superset of the matching essentials file. Names that appear only in the Brewfile still show up in the picker.
+
+Each catalog file has a `title`, an optional `description`, and a `packages` list. Origin is not in the file. The app stamps `builtin` for bundled catalogs.

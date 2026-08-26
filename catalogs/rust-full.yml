@@ -1,20 +1,23 @@
-- name: rustup
-  kind: formula
-  title: rustup
-  category: Languages
-- name: cargo-watch
-  kind: formula
-  title: cargo-watch
-  category: Languages
-- name: cargo-nextest
-  kind: formula
-  title: cargo-nextest
-  category: Languages
-- name: sccache
-  kind: formula
-  title: sccache
-  category: Languages
-- name: cargo-edit
-  kind: formula
-  title: cargo-edit
-  category: Languages
+title: Rust full
+description: Opinionated Rust setup
+packages:
+  - name: rustup
+    kind: formula
+    title: rustup
+    category: Languages
+  - name: cargo-watch
+    kind: formula
+    title: cargo-watch
+    category: Languages
+  - name: cargo-nextest
+    kind: formula
+    title: cargo-nextest
+    category: Languages
+  - name: sccache
+    kind: formula
+    title: sccache
+    category: Languages
+  - name: cargo-edit
+    kind: formula
+    title: cargo-edit
+    category: Languages

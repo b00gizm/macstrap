@@ -1,8 +1,11 @@
-- name: python@3.14
-  kind: formula
-  title: Python 3.14
-  category: Languages
-- name: uv
-  kind: formula
-  title: uv
-  category: Languages
+title: Python essentials
+description: Minimal Python setup
+packages:
+  - name: python@3.14
+    kind: formula
+    title: Python 3.14
+    category: Languages
+  - name: uv
+    kind: formula
+    title: uv
+    category: Languages
