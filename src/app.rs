@@ -477,8 +477,9 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
                 Style::default()
             };
             ListItem::new(Line::from(vec![Span::raw(format!(
-                "{mark} {:<20}{extra}",
-                file.title
+                "{mark} {:<20} {:<8}{extra}",
+                file.title,
+                file.origin.label()
             ))]))
             .style(style)
         })

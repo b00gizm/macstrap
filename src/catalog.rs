@@ -11,6 +11,19 @@ pub enum Kind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Origin {
+    Builtin,
+}
+
+impl Origin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CatalogId {
     CliEssentials,
     NodeEssentials,
@@ -24,6 +37,7 @@ pub enum CatalogId {
 pub struct CatalogFile {
     pub id: CatalogId,
     pub title: &'static str,
+    pub origin: Origin,
     pub required: bool,
     yaml: &'static str,
 }
@@ -32,42 +46,49 @@ const FILES: &[CatalogFile] = &[
     CatalogFile {
         id: CatalogId::CliEssentials,
         title: "CLI essentials",
+        origin: Origin::Builtin,
         required: true,
         yaml: include_str!("../catalogs/cli-essentials.yml"),
     },
     CatalogFile {
         id: CatalogId::NodeEssentials,
         title: "Node essentials",
+        origin: Origin::Builtin,
         required: false,
         yaml: include_str!("../catalogs/node-essentials.yml"),
     },
     CatalogFile {
         id: CatalogId::NodeFull,
         title: "Node full",
+        origin: Origin::Builtin,
         required: false,
         yaml: include_str!("../catalogs/node-full.yml"),
     },
     CatalogFile {
         id: CatalogId::PythonEssentials,
         title: "Python essentials",
+        origin: Origin::Builtin,
         required: false,
         yaml: include_str!("../catalogs/python-essentials.yml"),
     },
     CatalogFile {
         id: CatalogId::PythonFull,
         title: "Python full",
+        origin: Origin::Builtin,
         required: false,
         yaml: include_str!("../catalogs/python-full.yml"),
     },
     CatalogFile {
         id: CatalogId::RustEssentials,
         title: "Rust essentials",
+        origin: Origin::Builtin,
         required: false,
         yaml: include_str!("../catalogs/rust-essentials.yml"),
     },
     CatalogFile {
         id: CatalogId::RustFull,
         title: "Rust full",
+        origin: Origin::Builtin,
         required: false,
         yaml: include_str!("../catalogs/rust-full.yml"),
     },
@@ -238,6 +259,15 @@ mod tests {
             catalog.iter().filter(|p| p.name == "node").count(),
             1,
             "node from essentials and full must collapse to one row"
+        );
+    }
+
+    #[test]
+    fn bundled_files_are_builtin() {
+        assert!(
+            FILES
+                .iter()
+                .all(|f| f.origin == Origin::Builtin && f.origin.label() == "builtin")
         );
     }
 

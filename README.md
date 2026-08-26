@@ -34,7 +34,7 @@ cargo run -- --help
 
 The picker uses `space` to toggle, `a` for all, `n` for none, `/` to filter, `c` for catalogs, and `enter` to confirm. `q` or `ctrl+c` aborts. Already installed rows stay visible and are skipped on apply.
 
-`c` opens the catalog list. `cli-essentials.yml` is always loaded. Space loads or unloads the others. The tool list updates as soon as a file is loaded or unloaded.
+`c` opens the catalog list. Each row shows an origin. Bundled files are `builtin`. `cli-essentials.yml` is always loaded. Space loads or unloads the others. The tool list updates as soon as a file is loaded or unloaded.
 
 Deselect does not uninstall. The tool does not change your login shell unless it is still bash.
 
