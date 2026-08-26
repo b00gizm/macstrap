@@ -440,8 +440,26 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
     }
 }
 
+fn cell(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut chars: Vec<char> = s.chars().collect();
+    if chars.len() > width {
+        chars.truncate(width);
+        chars[width - 1] = '…';
+    }
+    let mut out: String = chars.into_iter().collect();
+    while out.chars().count() < width {
+        out.push(' ');
+    }
+    out
+}
+
 fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
+    let inner = areas[0].width.saturating_sub(2) as usize;
+    let desc_w = inner.saturating_sub(52);
     let visible = list.visible();
     let items: Vec<ListItem> = visible
         .iter()
@@ -451,7 +469,7 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
             let checked = list.selection.get(&pkg.id).copied().unwrap_or(false);
             let mark = if checked { "[x]" } else { "[ ]" };
             let installed = if list.observed.contains(&pkg.id) {
-                "  installed"
+                "installed"
             } else {
                 ""
             };
@@ -461,10 +479,11 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
                 Style::default()
             };
             ListItem::new(Line::from(vec![Span::raw(format!(
-                "{mark} {:<24} {:<12} {:<40}{installed}",
-                pkg.title,
-                pkg.category,
-                pkg.description.as_deref().unwrap_or("")
+                "{mark} {} {} {} {}",
+                cell(&pkg.title, 24),
+                cell(&pkg.category, 12),
+                cell(pkg.description.as_deref().unwrap_or(""), desc_w),
+                cell(installed, 9)
             ))]))
             .style(style)
         })
@@ -484,23 +503,26 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
 
 fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
     let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
+    let inner = areas[0].width.saturating_sub(2) as usize;
+    let desc_w = inner.saturating_sub(44);
     let items: Vec<ListItem> = catalog::files()
         .iter()
         .enumerate()
         .map(|(i, file)| {
             let checked = list.loaded.contains(&file.id) || file.required;
             let mark = if checked { "[x]" } else { "[ ]" };
-            let extra = if file.required { "  always on" } else { "" };
+            let extra = if file.required { "always on" } else { "" };
             let style = if i == list.catalog_cursor {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
             ListItem::new(Line::from(vec![Span::raw(format!(
-                "{mark} {:<20} {:<8} {:<32}{extra}",
-                file.title,
-                file.origin.label(),
-                file.description.unwrap_or("")
+                "{mark} {} {} {} {}",
+                cell(file.title, 20),
+                cell(file.origin.label(), 8),
+                cell(file.description.unwrap_or(""), desc_w),
+                cell(extra, 9)
             ))]))
             .style(style)
         })
@@ -558,6 +580,13 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn cell_clips_and_pads() {
+        assert_eq!(cell("hi", 4), "hi  ");
+        assert_eq!(cell("toolong", 4), "too…");
+        assert_eq!(cell("ab", 0), "");
     }
 
     #[test]

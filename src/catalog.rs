@@ -207,6 +207,11 @@ pub fn merge(catalog: &[Package], desired: &Desired) -> Merge {
             selection.insert(id.clone(), true);
         }
     }
+    packages.sort_by(|a, b| {
+        a.title
+            .to_ascii_lowercase()
+            .cmp(&b.title.to_ascii_lowercase())
+    });
     Merge {
         packages,
         selection,
@@ -355,6 +360,18 @@ mod tests {
                 file.title
             );
         }
+    }
+
+    #[test]
+    fn merge_sorts_by_title() {
+        let catalog = vec![
+            pkg(Kind::Formula, "jq", None),
+            pkg(Kind::Formula, "Git", None),
+            pkg(Kind::Formula, "fd", None),
+        ];
+        let merged = merge(&catalog, &Desired::new());
+        let titles: Vec<&str> = merged.packages.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["fd", "Git", "jq"]);
     }
 
     #[test]
