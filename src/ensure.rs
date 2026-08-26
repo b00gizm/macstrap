@@ -1,12 +1,14 @@
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
-use std::io::{self, Write};
+use std::collections::HashMap;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use std::collections::HashMap;
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::execute;
 
 use crate::catalog::{self, BrewFacts, Kind, Observed, Package, PkgId};
 
@@ -107,6 +109,28 @@ pub fn ensure_essentials(host: &impl Host) -> Essentials {
         brew: ensure_brew(host),
         omz: ensure_omz(host),
     }
+}
+
+pub fn ensure_cli_essentials(host: &impl Host) -> Result<(), Error> {
+    let loaded = catalog::default_loaded();
+    let packages = catalog::compose(&loaded).map_err(Error::Message)?;
+    let mut observed = host.installed()?;
+    let mut failed = 0;
+    for pkg in &packages {
+        let outcome = ensure_package(host, pkg, &observed);
+        print_outcome(&pkg.name, outcome);
+        match outcome {
+            Outcome::Applied | Outcome::Satisfied => {
+                observed.insert(pkg.id.clone());
+            }
+            Outcome::Failed => failed += 1,
+            Outcome::Removed => {}
+        }
+    }
+    if failed > 0 {
+        return Err(Error::Message(format!("{failed} cli essential(s) failed")));
+    }
+    Ok(())
 }
 
 pub fn ensure_package(host: &impl Host, pkg: &Package, observed: &Observed) -> Outcome {
@@ -452,9 +476,102 @@ fn mas_list(mas: &Path) -> Result<Vec<(u64, String)>, Error> {
     Ok(rows)
 }
 
+const OUTCOME_LABEL_WIDTH: usize = 22;
+
+fn pad_outcome_label(label: &str) -> String {
+    format!("{label:<OUTCOME_LABEL_WIDTH$}")
+}
+
+fn stdout_styled() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn outcome_display(outcome: Outcome) -> (&'static str, Color, &'static str) {
+    match outcome {
+        Outcome::Satisfied => ("✓", Color::Green, "ready"),
+        Outcome::Applied => ("+", Color::Cyan, "installed"),
+        Outcome::Removed => ("−", Color::Yellow, "removed"),
+        Outcome::Failed => ("✗", Color::Red, "failed"),
+    }
+}
+
+pub fn print_banner() {
+    let mut out = io::stdout();
+    if stdout_styled() {
+        let _ = execute!(
+            out,
+            Print("\n  "),
+            SetAttribute(Attribute::Bold),
+            SetForegroundColor(Color::Magenta),
+            Print("⚡ "),
+            Print(env!("CARGO_PKG_NAME")),
+            ResetColor,
+            Print("\n\n"),
+        );
+    } else {
+        let _ = writeln!(out, "\n{}\n", env!("CARGO_PKG_NAME"));
+    }
+}
+
+pub fn print_section(title: &str) {
+    let mut out = io::stdout();
+    if stdout_styled() {
+        let rule = "─".repeat(title.len());
+        let _ = execute!(
+            out,
+            Print("\n  "),
+            SetAttribute(Attribute::Bold),
+            SetForegroundColor(Color::Cyan),
+            Print(title),
+            ResetColor,
+            Print("\n  "),
+            SetForegroundColor(Color::DarkGrey),
+            Print(rule),
+            Print("\n\n"),
+            ResetColor,
+        );
+    } else {
+        let _ = writeln!(out, "\n{title}\n");
+    }
+}
+
+pub fn print_goodbye() {
+    let mut out = io::stdout();
+    if stdout_styled() {
+        let _ = execute!(
+            out,
+            Print("\n\n  "),
+            SetForegroundColor(Color::DarkGrey),
+            Print("Goodbye 👋"),
+            ResetColor,
+            Print("\n\n"),
+        );
+    } else {
+        let _ = writeln!(out, "\n\nGoodbye\n\n");
+    }
+}
+
 pub fn print_outcome(label: &str, outcome: Outcome) {
     let mut out = io::stdout();
-    let _ = writeln!(out, "{label:<12} {}", outcome.label());
+    let (icon, color, text) = outcome_display(outcome);
+    if stdout_styled() {
+        let _ = execute!(
+            out,
+            Print("  "),
+            SetForegroundColor(color),
+            Print(icon),
+            ResetColor,
+            Print("  "),
+            SetForegroundColor(Color::White),
+            Print(pad_outcome_label(label)),
+            SetForegroundColor(color),
+            Print(text),
+            ResetColor,
+            Print("\n"),
+        );
+    } else {
+        let _ = writeln!(out, "  {} {}", pad_outcome_label(label), outcome.label());
+    }
 }
 
 #[cfg(test)]
@@ -694,6 +811,34 @@ mod tests {
         assert_eq!(cask.description.as_deref(), Some("Open-source code editor"));
         assert_eq!(cask.available.as_deref(), Some("1.135.0"));
         assert_eq!(cask.installed.as_deref(), Some("1.87.1"));
+    }
+
+    #[test]
+    fn pad_outcome_label_fits_command_line_tools() {
+        let padded = pad_outcome_label("Command Line Tools");
+        assert_eq!(padded.chars().count(), OUTCOME_LABEL_WIDTH);
+        assert!(padded.starts_with("Command Line Tools"));
+    }
+
+    #[test]
+    fn outcome_display_maps_each_variant() {
+        assert_eq!(outcome_display(Outcome::Satisfied).2, "ready");
+        assert_eq!(outcome_display(Outcome::Applied).2, "installed");
+        assert_eq!(outcome_display(Outcome::Removed).2, "removed");
+        assert_eq!(outcome_display(Outcome::Failed).2, "failed");
+    }
+
+    #[test]
+    fn cli_essentials_installs_then_satisfies() {
+        let host = FakeHost::default();
+        ensure_cli_essentials(&host).unwrap();
+        let packages = catalog::compose(&catalog::default_loaded()).unwrap();
+        for pkg in &packages {
+            assert!(host.installed.borrow().contains(&pkg.id));
+        }
+        let installs = host.installs.borrow().len();
+        ensure_cli_essentials(&host).unwrap();
+        assert_eq!(host.installs.borrow().len(), installs);
     }
 
     #[test]

@@ -26,15 +26,17 @@ cargo run
 cargo run -- --help
 ```
 
-`--yes` applies `cli-essentials.yml` plus the Brewfile selection, without the picker. Optional catalogs are a picker action.
+`--yes` applies the Brewfile selection on top of auto-installed CLI essentials, without the picker. Optional catalogs are a picker action and persist in `~/.config/macstrap/config.yml`.
 
 `--brewfile PATH` reads that file instead of `$HOME/Brewfile` or `$HOME/.Brewfile`.
 
 `--essentials-only` stops after Command Line Tools, Homebrew, and oh-my-zsh.
 
-The picker uses `space` to toggle, `a` for all, `n` for none, `o` to show every installed brew package (off by default shows loaded catalogs plus installed tools from bundled catalogs), `/` to filter, `c` for catalogs, and `enter` to confirm. `q` or `ctrl+c` aborts. Installed rows start checked. Unchecking an installed row runs `brew uninstall` (or `mas uninstall`) on apply. After apply, the picker returns so you can install or uninstall more tools. `cli-essentials.yml` rows stay checked and never uninstall.
+After Command Line Tools, Homebrew, and oh-my-zsh, macstrap installs every package in `cli-essentials.yml` (git, gh, fd, fzf, jq) before opening the picker.
 
-`c` opens the catalog list. Each row shows an origin and a description. Bundled files are `builtin`. Custom files in `~/.config/macstrap` are `local`. `cli-essentials.yml` is always loaded. Space loads or unloads the others. The tool list updates as soon as a file is loaded or unloaded.
+The picker uses `space` to toggle, `a` for all, `n` for none, `o` to show every installed brew package (off by default shows loaded catalogs plus installed tools from bundled catalogs), `/` to filter, `c` for catalogs, and `enter` to confirm. `q` or `ctrl+c` aborts. Installed rows start checked and render green. Installed tools outside loaded catalogs render grey. Unchecking an installed row runs `brew uninstall` (or `mas uninstall`) on apply. After apply, the picker returns so you can install or uninstall more tools. `cli-essentials.yml` rows stay checked and never uninstall.
+
+`c` opens the catalog list. Each row shows an origin and a description. Bundled files are `builtin`. Custom files in `~/.config/macstrap` are `local`. `cli-essentials.yml` is always loaded. Space loads or unloads the others. Your selection persists in `~/.config/macstrap/config.yml` across runs. The tool list updates as soon as a file is loaded or unloaded.
 
 Create a custom catalog from the CLI or the catalog screen:
 

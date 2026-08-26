@@ -142,6 +142,9 @@ pub fn discover_local(config_dir: &Path) -> Result<Vec<CatalogFile>, String> {
         if ext != "yml" && ext != "yaml" {
             continue;
         }
+        if path.file_name().is_some_and(|n| n == "config.yml" || n == "config.yaml") {
+            continue;
+        }
         let path = path.canonicalize().unwrap_or(path);
         let id = CatalogId::Local(path.clone());
         out.push(CatalogFile {
@@ -244,6 +247,91 @@ pub fn create_catalog(input: CreateCatalogInput) -> Result<PathBuf, String> {
 
 pub fn default_loaded() -> HashSet<CatalogId> {
     FILES.iter().filter(|f| f.required).map(|f| f.id.clone()).collect()
+}
+
+pub fn is_required_catalog(id: &CatalogId) -> bool {
+    FILES
+        .iter()
+        .find(|f| &f.id == id)
+        .is_some_and(|f| f.required)
+}
+
+fn catalog_persist_key(id: &CatalogId) -> Option<String> {
+    match id {
+        CatalogId::CliEssentials => None,
+        CatalogId::NodeEssentials => Some("node-essentials".into()),
+        CatalogId::NodeFull => Some("node-full".into()),
+        CatalogId::PythonEssentials => Some("python-essentials".into()),
+        CatalogId::PythonFull => Some("python-full".into()),
+        CatalogId::RustEssentials => Some("rust-essentials".into()),
+        CatalogId::RustFull => Some("rust-full".into()),
+        CatalogId::Local(path) => {
+            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            Some(path.display().to_string())
+        }
+    }
+}
+
+fn parse_persisted_catalog(key: &str, config_dir: &Path) -> Option<CatalogId> {
+    match key {
+        "node-essentials" => Some(CatalogId::NodeEssentials),
+        "node-full" => Some(CatalogId::NodeFull),
+        "python-essentials" => Some(CatalogId::PythonEssentials),
+        "python-full" => Some(CatalogId::PythonFull),
+        "rust-essentials" => Some(CatalogId::RustEssentials),
+        "rust-full" => Some(CatalogId::RustFull),
+        _ => {
+            let path = PathBuf::from(key);
+            let path = if path.is_file() {
+                path
+            } else {
+                config_dir.join(key)
+            };
+            if path.is_file() {
+                Some(CatalogId::Local(path.canonicalize().unwrap_or(path)))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct PersistedConfig {
+    #[serde(default)]
+    catalogs: Vec<String>,
+}
+
+pub fn load_persisted_catalogs(config_dir: &Path) -> HashSet<CatalogId> {
+    let mut loaded = default_loaded();
+    let path = config_dir.join("config.yml");
+    let Ok(yaml) = std::fs::read_to_string(&path) else {
+        return loaded;
+    };
+    let Ok(config) = serde_yaml::from_str::<PersistedConfig>(&yaml) else {
+        return loaded;
+    };
+    for key in config.catalogs {
+        if let Some(id) = parse_persisted_catalog(&key, config_dir) {
+            if !is_required_catalog(&id) {
+                loaded.insert(id);
+            }
+        }
+    }
+    loaded
+}
+
+pub fn save_persisted_catalogs(config_dir: &Path, loaded: &HashSet<CatalogId>) -> Result<(), String> {
+    std::fs::create_dir_all(config_dir).map_err(|e| format!("{}: {e}", config_dir.display()))?;
+    let mut catalogs: Vec<String> = loaded
+        .iter()
+        .filter_map(catalog_persist_key)
+        .collect();
+    catalogs.sort();
+    let yaml = serde_yaml::to_string(&PersistedConfig { catalogs })
+        .map_err(|e| format!("config: {e}"))?;
+    std::fs::write(config_dir.join("config.yml"), yaml)
+        .map_err(|e| format!("{}: {e}", config_dir.join("config.yml").display()))
 }
 
 static PROTECTED: LazyLock<HashSet<PkgId>> = LazyLock::new(|| {
@@ -831,6 +919,54 @@ packages:
         assert_eq!(doc.title, "Foo Essentials");
         assert_eq!(doc.description.as_deref(), Some("My tools"));
         assert!(doc.packages.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_catalogs_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("macstrap-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = create_catalog(CreateCatalogInput {
+            filename: "mine.yml".into(),
+            title: "Mine".into(),
+            description: None,
+            location: dir.clone(),
+        })
+        .unwrap();
+        let mut loaded = default_loaded();
+        loaded.insert(CatalogId::NodeEssentials);
+        loaded.insert(CatalogId::RustFull);
+        loaded.insert(CatalogId::Local(path.clone()));
+        save_persisted_catalogs(&dir, &loaded).unwrap();
+        let yaml = std::fs::read_to_string(dir.join("config.yml")).unwrap();
+        assert!(yaml.contains("catalogs:"));
+        assert!(yaml.contains("node-essentials"));
+        assert!(yaml.contains("rust-full"));
+        assert!(!yaml.contains("cli-essentials"));
+        assert!(yaml.contains(&path.display().to_string()));
+        let restored = load_persisted_catalogs(&dir);
+        assert!(restored.contains(&CatalogId::CliEssentials));
+        assert!(restored.contains(&CatalogId::NodeEssentials));
+        assert!(restored.contains(&CatalogId::RustFull));
+        assert!(restored.contains(&CatalogId::Local(path)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_yml_is_not_a_catalog() {
+        let dir = std::env::temp_dir().join(format!("macstrap-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut loaded = default_loaded();
+        loaded.insert(CatalogId::PythonEssentials);
+        save_persisted_catalogs(&dir, &loaded).unwrap();
+        let entries = all_entries(&dir).unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.file().path() != Some(dir.join("config.yml").as_path()))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
