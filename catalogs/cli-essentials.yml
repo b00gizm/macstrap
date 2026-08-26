@@ -21,3 +21,7 @@ packages:
     kind: formula
     title: jq
     category: CLI
+  - name: mas
+    kind: formula
+    title: mas
+    category: CLI
