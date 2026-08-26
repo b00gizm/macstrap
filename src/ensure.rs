@@ -6,7 +6,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use crate::catalog::{Kind, Observed, Package, PkgId};
+use std::collections::HashMap;
+
+use crate::catalog::{self, Kind, Observed, Package, PkgId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
@@ -57,6 +59,7 @@ pub trait Host {
     fn install_omz(&self) -> Result<(), Error>;
     fn installed(&self) -> Result<Observed, Error>;
     fn install(&self, pkg: &Package) -> Result<(), Error>;
+    fn descriptions(&self, packages: &[Package]) -> Result<HashMap<PkgId, String>, Error>;
 }
 
 pub fn ensure_clt(host: &impl Host) -> Outcome {
@@ -232,6 +235,65 @@ impl Host for Live {
             }
         }
     }
+
+    fn descriptions(&self, packages: &[Package]) -> Result<HashMap<PkgId, String>, Error> {
+        let missing: Vec<&Package> = packages
+            .iter()
+            .filter(|p| catalog::needs_brew_desc(p))
+            .collect();
+        if missing.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let Some(brew) = find_brew() else {
+            return Ok(HashMap::new());
+        };
+        let output = Command::new(brew)
+            .arg("info")
+            .arg("--json=v2")
+            .args(missing.iter().map(|p| p.name.as_str()))
+            .output()?;
+        if !output.status.success() {
+            return Ok(HashMap::new());
+        }
+        Ok(parse_brew_info(&String::from_utf8_lossy(&output.stdout)).unwrap_or_default())
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BrewInfoJson {
+    #[serde(default)]
+    formulae: Vec<BrewFormula>,
+    #[serde(default)]
+    casks: Vec<BrewCask>,
+}
+
+#[derive(serde::Deserialize)]
+struct BrewFormula {
+    name: String,
+    desc: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BrewCask {
+    token: String,
+    desc: Option<String>,
+}
+
+fn parse_brew_info(json: &str) -> Result<HashMap<PkgId, String>, Error> {
+    let parsed: BrewInfoJson =
+        serde_json::from_str(json).map_err(|e| Error::Message(format!("brew info: {e}")))?;
+    let mut out = HashMap::new();
+    for f in parsed.formulae {
+        if let Some(desc) = f.desc.filter(|s| !s.is_empty()) {
+            out.insert(PkgId::new(Kind::Formula, &f.name, None), desc);
+        }
+    }
+    for c in parsed.casks {
+        if let Some(desc) = c.desc.filter(|s| !s.is_empty()) {
+            out.insert(PkgId::new(Kind::Cask, &c.token, None), desc);
+        }
+    }
+    Ok(out)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -325,6 +387,7 @@ pub struct FakeHost {
     pub omz_calls: Cell<u32>,
     pub installs: RefCell<Vec<PkgId>>,
     pub fail: Cell<bool>,
+    pub descriptions: RefCell<HashMap<PkgId, String>>,
 }
 
 #[cfg(test)]
@@ -340,6 +403,7 @@ impl Default for FakeHost {
             omz_calls: Cell::new(0),
             installs: RefCell::new(Vec::new()),
             fail: Cell::new(false),
+            descriptions: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -399,6 +463,15 @@ impl Host for FakeHost {
         self.installed.borrow_mut().insert(pkg.id.clone());
         Ok(())
     }
+
+    fn descriptions(&self, packages: &[Package]) -> Result<HashMap<PkgId, String>, Error> {
+        let stored = self.descriptions.borrow();
+        Ok(packages
+            .iter()
+            .filter(|p| catalog::needs_brew_desc(p))
+            .filter_map(|p| stored.get(&p.id).cloned().map(|d| (p.id.clone(), d)))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +519,7 @@ mod tests {
             mas_id: None,
             title: "Git".into(),
             category: "CLI".into(),
+            description: None,
         };
         host.installed.borrow_mut().insert(pkg.id.clone());
         assert_eq!(
@@ -465,11 +539,61 @@ mod tests {
             mas_id: None,
             title: "Git".into(),
             category: "CLI".into(),
+            description: None,
         };
         let empty = Observed::new();
         assert_eq!(ensure_package(&host, &pkg, &empty), Outcome::Applied);
         let observed = host.installed.borrow().clone();
         assert_eq!(ensure_package(&host, &pkg, &observed), Outcome::Satisfied);
         assert_eq!(host.installs.borrow().len(), 1);
+    }
+
+    #[test]
+    fn parse_brew_info_maps_formula_and_cask() {
+        let json = r#"{
+            "formulae": [{"name": "git", "desc": "Distributed revision control system"}],
+            "casks": [{"token": "visual-studio-code", "desc": "Open-source code editor"}]
+        }"#;
+        let map = parse_brew_info(json).unwrap();
+        assert_eq!(
+            map[&PkgId::new(Kind::Formula, "git", None)],
+            "Distributed revision control system"
+        );
+        assert_eq!(
+            map[&PkgId::new(Kind::Cask, "visual-studio-code", None)],
+            "Open-source code editor"
+        );
+    }
+
+    #[test]
+    fn fake_descriptions_skip_yaml_and_mas() {
+        let host = FakeHost::default();
+        let git = Package {
+            id: PkgId::new(Kind::Formula, "git", None),
+            kind: Kind::Formula,
+            name: "git".into(),
+            mas_id: None,
+            title: "Git".into(),
+            category: "CLI".into(),
+            description: Some("yaml".into()),
+        };
+        let jq = Package {
+            id: PkgId::new(Kind::Formula, "jq", None),
+            kind: Kind::Formula,
+            name: "jq".into(),
+            mas_id: None,
+            title: "jq".into(),
+            category: "CLI".into(),
+            description: None,
+        };
+        host.descriptions
+            .borrow_mut()
+            .insert(jq.id.clone(), "jq desc".into());
+        host.descriptions
+            .borrow_mut()
+            .insert(git.id.clone(), "brew git".into());
+        let map = host.descriptions(&[git, jq]).unwrap();
+        assert!(!map.contains_key(&PkgId::new(Kind::Formula, "git", None)));
+        assert_eq!(map[&PkgId::new(Kind::Formula, "jq", None)], "jq desc");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
@@ -52,6 +52,7 @@ pub struct CatalogList {
     pub desired: Desired,
     pub cursor: usize,
     pub catalog_cursor: usize,
+    pub descriptions: HashMap<catalog::PkgId, String>,
     pub filter: String,
     pub filtering: bool,
 }
@@ -69,6 +70,10 @@ impl CatalogList {
                 pkg.title.to_ascii_lowercase().contains(&q)
                     || pkg.name.to_ascii_lowercase().contains(&q)
                     || pkg.category.to_ascii_lowercase().contains(&q)
+                    || pkg
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| d.to_ascii_lowercase().contains(&q))
             })
             .map(|(i, _)| i)
             .collect()
@@ -119,6 +124,7 @@ impl CatalogList {
                 self.selection.insert(id, on);
             }
         }
+        catalog::apply_descriptions(&mut self.packages, &self.descriptions);
         let vis = self.visible().len();
         self.cursor = if vis == 0 {
             0
@@ -260,7 +266,7 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
             skipped.len()
         );
     }
-    let merged = catalog::merge(&catalog, &desired);
+    let mut merged = catalog::merge(&catalog, &desired);
     let observed = host.installed()?;
 
     if opts.yes {
@@ -272,6 +278,16 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         ));
     }
 
+    let all: HashSet<catalog::CatalogId> = catalog::files().iter().map(|f| f.id).collect();
+    let mut universe = catalog::compose(&all).map_err(Error::Message)?;
+    for pkg in desired.values() {
+        if !universe.iter().any(|p| p.id == pkg.id) {
+            universe.push(pkg.clone());
+        }
+    }
+    let descriptions = host.descriptions(&universe)?;
+    catalog::apply_descriptions(&mut merged.packages, &descriptions);
+
     let mut list = CatalogList {
         packages: merged.packages,
         selection: merged.selection,
@@ -280,6 +296,7 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         desired,
         cursor: 0,
         catalog_cursor: 0,
+        descriptions,
         filter: String::new(),
         filtering: false,
     };
@@ -344,6 +361,7 @@ fn apply(
             mas_id: None,
             title: "mas".into(),
             category: "CLI".into(),
+            description: None,
         };
         let mas = packages.iter().find(|p| p.id == mas_id).unwrap_or(&owned);
         let outcome = ensure::ensure_package(host, mas, &seen);
@@ -443,8 +461,10 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
                 Style::default()
             };
             ListItem::new(Line::from(vec![Span::raw(format!(
-                "{mark} {:<24} {:<12}{installed}",
-                pkg.title, pkg.category
+                "{mark} {:<24} {:<12} {:<40}{installed}",
+                pkg.title,
+                pkg.category,
+                pkg.description.as_deref().unwrap_or("")
             ))]))
             .style(style)
         })
@@ -477,9 +497,10 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
                 Style::default()
             };
             ListItem::new(Line::from(vec![Span::raw(format!(
-                "{mark} {:<20} {:<8}{extra}",
+                "{mark} {:<20} {:<8} {:<32}{extra}",
                 file.title,
-                file.origin.label()
+                file.origin.label(),
+                file.description.unwrap_or("")
             ))]))
             .style(style)
         })
@@ -511,6 +532,7 @@ mod tests {
             mas_id: None,
             title: name.into(),
             category: "CLI".into(),
+            description: None,
         }
     }
 
@@ -528,6 +550,7 @@ mod tests {
             desired: Desired::new(),
             cursor: 0,
             catalog_cursor: 0,
+            descriptions: HashMap::new(),
             filter: String::new(),
             filtering: false,
         }
@@ -561,6 +584,7 @@ mod tests {
             desired: Desired::new(),
             cursor: 0,
             catalog_cursor: 0,
+            descriptions: HashMap::new(),
             filter: String::new(),
             filtering: false,
         }
@@ -607,6 +631,19 @@ mod tests {
             l.handle_catalog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             CatalogsAction::Done
         ));
+    }
+
+    #[test]
+    fn reload_applies_cached_brew_descriptions() {
+        let mut l = live_list();
+        l.descriptions.insert(
+            PkgId::new(Kind::Formula, "node", None),
+            "JavaScript runtime".into(),
+        );
+        l.catalog_cursor = catalog_index(CatalogId::NodeEssentials);
+        l.toggle_catalog();
+        let node = l.packages.iter().find(|p| p.name == "node").unwrap();
+        assert_eq!(node.description.as_deref(), Some("JavaScript runtime"));
     }
 
     #[test]

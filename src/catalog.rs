@@ -38,6 +38,7 @@ pub struct CatalogFile {
     pub id: CatalogId,
     pub title: &'static str,
     pub origin: Origin,
+    pub description: Option<&'static str>,
     pub required: bool,
     yaml: &'static str,
 }
@@ -47,6 +48,7 @@ const FILES: &[CatalogFile] = &[
         id: CatalogId::CliEssentials,
         title: "CLI essentials",
         origin: Origin::Builtin,
+        description: Some("Absolute must-haves"),
         required: true,
         yaml: include_str!("../catalogs/cli-essentials.yml"),
     },
@@ -54,6 +56,7 @@ const FILES: &[CatalogFile] = &[
         id: CatalogId::NodeEssentials,
         title: "Node essentials",
         origin: Origin::Builtin,
+        description: Some("Minimal Node.js setup"),
         required: false,
         yaml: include_str!("../catalogs/node-essentials.yml"),
     },
@@ -61,6 +64,7 @@ const FILES: &[CatalogFile] = &[
         id: CatalogId::NodeFull,
         title: "Node full",
         origin: Origin::Builtin,
+        description: Some("Opinionated Node.js setup"),
         required: false,
         yaml: include_str!("../catalogs/node-full.yml"),
     },
@@ -68,6 +72,7 @@ const FILES: &[CatalogFile] = &[
         id: CatalogId::PythonEssentials,
         title: "Python essentials",
         origin: Origin::Builtin,
+        description: Some("Minimal Python setup"),
         required: false,
         yaml: include_str!("../catalogs/python-essentials.yml"),
     },
@@ -75,6 +80,7 @@ const FILES: &[CatalogFile] = &[
         id: CatalogId::PythonFull,
         title: "Python full",
         origin: Origin::Builtin,
+        description: Some("Opinionated Python setup"),
         required: false,
         yaml: include_str!("../catalogs/python-full.yml"),
     },
@@ -82,6 +88,7 @@ const FILES: &[CatalogFile] = &[
         id: CatalogId::RustEssentials,
         title: "Rust essentials",
         origin: Origin::Builtin,
+        description: Some("Minimal Rust setup"),
         required: false,
         yaml: include_str!("../catalogs/rust-essentials.yml"),
     },
@@ -89,6 +96,7 @@ const FILES: &[CatalogFile] = &[
         id: CatalogId::RustFull,
         title: "Rust full",
         origin: Origin::Builtin,
+        description: Some("Opinionated Rust setup"),
         required: false,
         yaml: include_str!("../catalogs/rust-full.yml"),
     },
@@ -124,6 +132,7 @@ pub struct Package {
     pub mas_id: Option<u64>,
     pub title: String,
     pub category: String,
+    pub description: Option<String>,
 }
 
 pub type Catalog = Vec<Package>;
@@ -139,6 +148,8 @@ struct CatalogRow {
     mas_id: Option<u64>,
     title: String,
     category: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 impl From<CatalogRow> for Package {
@@ -151,6 +162,7 @@ impl From<CatalogRow> for Package {
             mas_id: row.mas_id,
             title: row.title,
             category: row.category,
+            description: row.description,
         }
     }
 }
@@ -201,6 +213,20 @@ pub fn merge(catalog: &[Package], desired: &Desired) -> Merge {
     }
 }
 
+pub fn needs_brew_desc(pkg: &Package) -> bool {
+    pkg.description.is_none() && matches!(pkg.kind, Kind::Formula | Kind::Cask)
+}
+
+pub fn apply_descriptions(packages: &mut [Package], descs: &HashMap<PkgId, String>) {
+    for pkg in packages {
+        if needs_brew_desc(pkg)
+            && let Some(desc) = descs.get(&pkg.id)
+        {
+            pkg.description = Some(desc.clone());
+        }
+    }
+}
+
 pub fn pending<'a>(
     packages: &'a [Package],
     selection: &Selection,
@@ -228,6 +254,7 @@ mod tests {
             mas_id,
             title: name.to_string(),
             category: "Test".to_string(),
+            description: None,
         }
     }
 
@@ -260,6 +287,53 @@ mod tests {
             1,
             "node from essentials and full must collapse to one row"
         );
+    }
+
+    #[test]
+    fn yaml_description_is_optional() {
+        let rows = load(
+            r#"
+- name: git
+  kind: formula
+  title: Git
+  category: CLI
+  description: Distributed version control
+- name: jq
+  kind: formula
+  title: jq
+  category: CLI
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rows[0].description.as_deref(),
+            Some("Distributed version control")
+        );
+        assert_eq!(rows[1].description, None);
+    }
+
+    #[test]
+    fn apply_descriptions_fills_gaps_and_keeps_yaml() {
+        let mut packages = vec![
+            pkg(Kind::Formula, "git", None),
+            pkg(Kind::Formula, "jq", None),
+            pkg(Kind::Mas, "Yoink", Some(457622435)),
+        ];
+        packages[0].description = Some("from yaml".into());
+        let mut descs = HashMap::new();
+        descs.insert(PkgId::new(Kind::Formula, "git", None), "from brew".into());
+        descs.insert(PkgId::new(Kind::Formula, "jq", None), "jq desc".into());
+        descs.insert(
+            PkgId::new(Kind::Mas, "Yoink", Some(457622435)),
+            "should not apply".into(),
+        );
+        apply_descriptions(&mut packages, &descs);
+        assert_eq!(packages[0].description.as_deref(), Some("from yaml"));
+        assert_eq!(packages[1].description.as_deref(), Some("jq desc"));
+        assert_eq!(packages[2].description, None);
+        assert!(needs_brew_desc(&pkg(Kind::Formula, "fd", None)));
+        assert!(!needs_brew_desc(&packages[0]));
+        assert!(!needs_brew_desc(&packages[2]));
     }
 
     #[test]
