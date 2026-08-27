@@ -12,13 +12,15 @@ The crate name in `Cargo.toml` is a working title. Rust reads it through `CARGO_
 curl -fsSL https://raw.githubusercontent.com/b00gizm/macstrap/main/scripts/install.sh | bash
 ```
 
-The script downloads the latest release binary for your Mac, checks the SHA-256, and writes it to `$HOME/.local/bin`. It needs no sudo.
+The script downloads the latest release binary for your Mac, checks the SHA-256, and writes it to `$HOME/.local/bin/macstrap`. It needs no sudo. This command does not start the picker. Run `macstrap` after the install to bootstrap.
 
-Until a release exists, build from this repo:
+Pass extra arguments through with `bash -s --`:
 
 ```bash
-cargo run
+curl -fsSL https://raw.githubusercontent.com/b00gizm/macstrap/main/scripts/install.sh | bash -s -- --yes
 ```
+
+From source, run `cargo run`.
 
 ## Usage
 

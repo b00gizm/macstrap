@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Confirmed and `--yes` runs write the checked set to `desired` in `~/.config/macstrap/config.yml`.
 - `s` in the picker appends the current package to an existing local catalog.
 
+### Changed
+
+- A bare `curl | bash` install writes `$HOME/.local/bin/macstrap` and exits. Extra arguments after `bash -s --` are still passed through to the installed binary.
+
 ## [0.2.0] - 2026-08-27
 
 ### Added
