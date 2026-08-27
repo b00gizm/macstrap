@@ -46,4 +46,9 @@ case ":$PATH:" in
 *) echo "add $bindir to PATH so the next shell finds $NAME" ;;
 esac
 
-exec "$bindir/$NAME" "$@"
+if [ "$#" -gt 0 ]; then
+	exec "$bindir/$NAME" "$@"
+fi
+
+echo "installed to $bindir/$NAME"
+echo "run macstrap to bootstrap"

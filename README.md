@@ -12,13 +12,15 @@ The crate name in `Cargo.toml` is a working title. Rust reads it through `CARGO_
 curl -fsSL https://raw.githubusercontent.com/b00gizm/macstrap/main/scripts/install.sh | bash
 ```
 
-The script downloads the latest release binary for your Mac, checks the SHA-256, and writes it to `$HOME/.local/bin`. It needs no sudo.
+The script downloads the latest release binary for your Mac, checks the SHA-256, and writes it to `$HOME/.local/bin/macstrap`. It needs no sudo. This command does not start the picker. Run `macstrap` after the install to bootstrap.
 
-Until a release exists, build from this repo:
+Pass extra arguments through with `bash -s --`:
 
 ```bash
-cargo run
+curl -fsSL https://raw.githubusercontent.com/b00gizm/macstrap/main/scripts/install.sh | bash -s -- --yes
 ```
+
+From source, run `cargo run`.
 
 ## Usage
 
@@ -47,8 +49,6 @@ macstrap catalog create
 In the catalog screen, press `n`. Both flows ask for a file name, title (default inferred from the file name, e.g. `foo-essentials.yaml` → `Foo Essentials`), description, and location (default `~/.config/macstrap`). New files start with an empty `packages` list.
 
 Descriptions are optional. An empty description stays blank. A formula or cask without one uses `brew info`. That same call fills the installed and available version columns.
-
-The tool does not change your login shell unless it is still bash.
 
 ## Brewfile
 

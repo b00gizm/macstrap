@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A bare `curl | bash` install writes `$HOME/.local/bin/macstrap` and exits. Extra arguments after `bash -s --` are still passed through to the installed binary.
+
 ## [0.2.0] - 2026-08-27
 
 ### Added
@@ -43,5 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bundled `cli-essentials.yml` catalog (git, gh, fd, fzf, jq).
 - curl installer script and GitHub Actions release workflow for macOS arm64 and amd64.
 
+[Unreleased]: https://github.com/b00gizm/macstrap/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/b00gizm/macstrap/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/b00gizm/macstrap/releases/tag/v0.1.0
