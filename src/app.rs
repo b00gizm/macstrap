@@ -8,7 +8,7 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::brewfile;
 use crate::catalog::{
@@ -582,7 +582,7 @@ fn cell(s: &str, width: usize) -> String {
     out
 }
 
-fn package_row_style(pkg: &Package, list: &CatalogList, cursor: bool) -> Style {
+fn package_row_style(pkg: &Package, list: &CatalogList) -> Style {
     let mut style = Style::default();
     if list.observed.contains(&pkg.id) {
         style = if list.catalog_pkg_ids.contains(&pkg.id) {
@@ -590,9 +590,6 @@ fn package_row_style(pkg: &Package, list: &CatalogList, cursor: bool) -> Style {
         } else {
             style.fg(Color::DarkGray)
         };
-    }
-    if cursor {
-        style = style.add_modifier(Modifier::REVERSED);
     }
     style
 }
@@ -605,11 +602,11 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     let items: Vec<ListItem> = visible
         .iter()
         .enumerate()
-        .map(|(vis_i, &i)| {
+        .map(|(_, &i)| {
             let pkg = &list.packages[i];
             let checked = list.selection.get(&pkg.id).copied().unwrap_or(false);
             let mark = if checked { "[x]" } else { "[ ]" };
-            let style = package_row_style(pkg, list, vis_i == list.cursor);
+            let style = package_row_style(pkg, list);
             ListItem::new(Line::from(vec![Span::raw(format!(
                 "{mark} {} {} {} {} {}",
                 cell(&pkg.title, 24),
@@ -628,8 +625,15 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     } else {
         "Choose tools · catalog".into()
     };
-    let widget = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-    frame.render_widget(widget, areas[0]);
+    let widget = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(if visible.is_empty() {
+        None
+    } else {
+        Some(list.cursor)
+    });
+    frame.render_stateful_widget(widget, areas[0], &mut state);
     frame.render_widget(
         Paragraph::new(
             "space toggle  a all  n none  o all installed  / filter  c catalogs  enter confirm  q abort",
@@ -646,16 +650,11 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
         .catalog_entries
         .iter()
         .enumerate()
-        .map(|(i, entry)| {
+        .map(|(_, entry)| {
             let file = entry.file();
             let checked = list.loaded.contains(&file.id) || file.required;
             let mark = if checked { "[x]" } else { "[ ]" };
             let extra = if file.required { "always on" } else { "" };
-            let style = if i == list.catalog_cursor {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
             let doc = file.doc().expect("embedded catalogs parse");
             ListItem::new(Line::from(vec![Span::raw(format!(
                 "{mark} {} {} {} {}",
@@ -664,11 +663,17 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
                 cell(doc.description.as_deref().unwrap_or(""), desc_w),
                 cell(extra, 9)
             ))]))
-            .style(style)
         })
         .collect();
-    let widget = List::new(items).block(Block::default().borders(Borders::ALL).title("Catalogs"));
-    frame.render_widget(widget, areas[0]);
+    let widget = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Catalogs"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(if list.catalog_entries.is_empty() {
+        None
+    } else {
+        Some(list.catalog_cursor)
+    });
+    frame.render_stateful_widget(widget, areas[0], &mut state);
     frame.render_widget(Paragraph::new("space load/unload  n new  enter back"), areas[1]);
 }
 
@@ -1042,7 +1047,6 @@ mod tests {
             package_row_style(
                 l.packages.iter().find(|p| p.id == git).unwrap(),
                 &l,
-                false
             )
             .fg,
             Some(Color::Green)
@@ -1051,7 +1055,6 @@ mod tests {
             package_row_style(
                 l.packages.iter().find(|p| p.id == node).unwrap(),
                 &l,
-                false
             )
             .fg,
             Some(Color::DarkGray)
@@ -1060,11 +1063,67 @@ mod tests {
             package_row_style(
                 l.packages.iter().find(|p| p.name == "jq").unwrap(),
                 &l,
-                false
             )
             .fg,
             None
         );
+    }
+
+    fn long_pick_list(cursor: usize) -> CatalogList {
+        let packages: Vec<Package> = (0..30)
+            .map(|i| {
+                let name = format!("tool-{i:02}");
+                Package {
+                    id: PkgId::new(Kind::Formula, &name, None),
+                    kind: Kind::Formula,
+                    name: name.clone(),
+                    mas_id: None,
+                    title: name,
+                    category: "CLI".into(),
+                    description: None,
+                    available: None,
+                    installed_version: None,
+                }
+            })
+            .collect();
+        let config_dir = catalog::default_config_dir();
+        let loaded = catalog::default_loaded();
+        CatalogList {
+            packages,
+            selection: Selection::new(),
+            observed: Observed::new(),
+            loaded,
+            catalog_pkg_ids: HashSet::new(),
+            desired: Desired::new(),
+            cursor,
+            catalog_cursor: 0,
+            catalog_entries: catalog::all_entries(&config_dir).unwrap(),
+            config_dir,
+            facts: HashMap::new(),
+            filter: String::new(),
+            filtering: false,
+            show_all_installed: false,
+        }
+    }
+
+    #[test]
+    fn pick_list_scrolls_to_cursor() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let list = long_pick_list(25);
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_pick(frame, &list)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("tool-25"), "selected row should be visible");
+        assert!(!text.contains("tool-00"), "first row should scroll off screen");
     }
 
     #[test]
