@@ -63,3 +63,13 @@ Curated lists live in `catalogs/`. `cli-essentials.yml` is always on. The others
 A full file is a superset of the matching essentials file. Names that appear only in the Brewfile still show up in the picker.
 
 Each catalog file has a `title`, an optional `description`, and a `packages` list. Origin is not in the file. The app stamps `builtin` for bundled catalogs.
+
+Formulae use `kind: formula`. Casks use `kind: cask`. Mac App Store apps use `kind: mas` with a numeric `mas_id` (the App Store ID from Brewfile-style `mas "Title", id: 123`). `name` is the internal key. `title` is what the picker shows. `category` groups rows in the list. Apply installs the `mas` CLI first when any selected mas app is pending.
+
+```yaml
+  - name: Yoink
+    kind: mas
+    mas_id: 457622435
+    title: Yoink
+    category: Utilities
+```
