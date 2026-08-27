@@ -13,3 +13,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
+      - run: sh testdata/install-no-exec.sh
