@@ -2,7 +2,7 @@
 
 Install Xcode Command Line Tools, Homebrew, and oh-my-zsh. Then pick extra formulae, casks, and Mac App Store apps in a terminal UI.
 
-If `$HOME/Brewfile` exists, those rows start checked. Installed tools in the picker also start checked. You can toggle any row, select all, or select none. Unchecking an installed tool uninstalls it on apply.
+If `$HOME/Brewfile` exists, those rows start checked. Installed tools in the picker also start checked until you confirm a selection. macstrap then records the checked set in `~/.config/macstrap/config.yml` for later runs. You can toggle any row, select all, or select none. Unchecking an installed tool uninstalls it on apply.
 
 The crate name in `Cargo.toml` is a working title. Rust reads it through `CARGO_PKG_NAME`. The installer script has `NAME` and `REPO` at the top. Change those when you rename the project.
 
@@ -26,7 +26,7 @@ cargo run
 cargo run -- --help
 ```
 
-`--yes` applies the Brewfile selection on top of auto-installed CLI essentials, without the picker. Optional catalogs are a picker action and persist in `~/.config/macstrap/config.yml`.
+`--yes` applies the recorded checked set unioned with the Brewfile, without the picker. Before the first recorded selection, installed rows still start checked. Optional catalogs and the checked set persist in `~/.config/macstrap/config.yml`.
 
 `--brewfile PATH` reads that file instead of `$HOME/Brewfile` or `$HOME/.Brewfile`.
 
@@ -34,7 +34,7 @@ cargo run -- --help
 
 After Command Line Tools, Homebrew, and oh-my-zsh, macstrap installs every package in `cli-essentials.yml` (git, gh, fd, fzf, jq, mas) before opening the picker.
 
-The picker uses `space` to toggle, `a` for all, `n` for none, `o` to show every installed brew package (off by default shows loaded catalogs plus installed tools from bundled catalogs), `/` to filter, `c` for catalogs, and `enter` to confirm. `q` or `ctrl+c` aborts. Installed rows start checked and render green. Installed tools outside loaded catalogs render grey. Unchecking an installed row runs `brew uninstall` (or `mas uninstall`) on apply. After apply, the picker returns so you can install or uninstall more tools. `cli-essentials.yml` rows stay checked and never uninstall.
+The picker uses `space` to toggle, `a` for all, `n` for none, `o` to show every installed brew package (off by default shows loaded catalogs plus installed tools from bundled catalogs), `/` to filter, `c` for catalogs, `s` to save the current row to a local catalog, and `enter` to confirm. `q` or `ctrl+c` aborts. Installed rows start checked and render green. Installed tools outside loaded catalogs render grey. Unchecking an installed row runs `brew uninstall` (or `mas uninstall`) on apply. After apply, the picker returns so you can install or uninstall more tools. `cli-essentials.yml` rows stay checked and never uninstall.
 
 `c` opens the catalog list. Each row shows an origin and a description. Bundled files are `builtin`. Custom files in `~/.config/macstrap` are `local`. `cli-essentials.yml` is always loaded. Space loads or unloads the others. Your selection persists in `~/.config/macstrap/config.yml` across runs. The tool list updates as soon as a file is loaded or unloaded.
 
@@ -45,6 +45,8 @@ macstrap catalog create
 ```
 
 In the catalog screen, press `n`. Both flows ask for a file name, title (default inferred from the file name, e.g. `foo-essentials.yaml` → `Foo Essentials`), description, and location (default `~/.config/macstrap`). New files start with an empty `packages` list.
+
+Press `s` on a tool to append it to an existing local catalog. One local catalog saves immediately. Several local catalogs open a target picker. If none exist, create one with `c` then `n`.
 
 Descriptions are optional. An empty description stays blank. A formula or cask without one uses `brew info`. That same call fills the installed and available version columns.
 

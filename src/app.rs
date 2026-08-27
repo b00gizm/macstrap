@@ -8,11 +8,11 @@ use crossterm::event::{
     KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
+use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::DefaultTerminal;
 
 use crate::brewfile;
 use crate::catalog::{
@@ -49,15 +49,18 @@ pub enum CatalogCommand {
     Create,
 }
 
+#[derive(Clone)]
 enum Page {
     Pick,
     Catalogs,
+    SaveRow { package: Package },
     Confirm,
 }
 
 enum PickAction {
     Continue,
     Catalogs,
+    SaveRow { package: Package },
     Confirm,
     Abort,
 }
@@ -69,25 +72,37 @@ enum CatalogsAction {
     Abort,
 }
 
+enum SaveRowAction {
+    Continue,
+    Save,
+    Cancel,
+    Abort,
+}
+
 pub struct CatalogList {
     pub packages: Vec<Package>,
     pub selection: Selection,
     pub observed: Observed,
     pub loaded: HashSet<CatalogId>,
     pub desired: Desired,
+    pub persist_intent: catalog::PersistIntent,
     pub cursor: usize,
     pub catalog_cursor: usize,
+    pub save_cursor: usize,
     pub catalog_entries: Vec<CatalogEntry>,
     pub config_dir: PathBuf,
     pub facts: HashMap<catalog::PkgId, catalog::BrewFacts>,
     pub filter: String,
     pub filtering: bool,
     pub show_all_installed: bool,
+    pub status: Option<String>,
     pub catalog_pkg_ids: HashSet<PkgId>,
     list_state: ListState,
     catalog_list_state: ListState,
+    save_list_state: ListState,
     pick_rows: usize,
     catalog_rows: usize,
+    save_rows: usize,
 }
 
 impl CatalogList {
@@ -114,6 +129,10 @@ impl CatalogList {
 
     fn current(&self) -> Option<usize> {
         self.visible().get(self.cursor).copied()
+    }
+
+    fn current_package(&self) -> Option<&Package> {
+        self.current().and_then(|index| self.packages.get(index))
     }
 
     pub fn toggle(&mut self) {
@@ -231,6 +250,39 @@ impl CatalogList {
         *self.catalog_list_state.offset_mut() = off;
     }
 
+    fn set_save_cursor(&mut self, index: usize) {
+        let len = catalog::local_files(&self.catalog_entries).len();
+        if len == 0 {
+            self.save_cursor = 0;
+            self.save_list_state.select(None);
+            *self.save_list_state.offset_mut() = 0;
+            return;
+        }
+        self.save_cursor = index.min(len - 1);
+        self.save_list_state.select(Some(self.save_cursor));
+    }
+
+    fn move_save_cursor(&mut self, delta: isize) {
+        let len = catalog::local_files(&self.catalog_entries).len();
+        if len == 0 {
+            self.set_save_cursor(0);
+            return;
+        }
+        let next = self.save_cursor as isize + delta;
+        self.set_save_cursor(next.clamp(0, len as isize - 1) as usize);
+    }
+
+    fn scroll_save(&mut self, delta: isize) {
+        let len = catalog::local_files(&self.catalog_entries).len();
+        if len == 0 {
+            self.set_save_cursor(0);
+            return;
+        }
+        let next = (self.save_cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.set_save_cursor(next);
+        *self.save_list_state.offset_mut() = next.min(len.saturating_sub(self.save_rows.max(1)));
+    }
+
     pub fn reload(&mut self) {
         let catalog = catalog::compose(&self.loaded).expect("embedded catalogs parse");
         self.catalog_pkg_ids = catalog.iter().map(|p| p.id.clone()).collect();
@@ -260,8 +312,9 @@ impl CatalogList {
         self.reload();
     }
 
-    pub fn persist_catalogs(&self) -> Result<(), Error> {
-        catalog::save_persisted_catalogs(&self.config_dir, &self.loaded).map_err(Error::Message)
+    pub fn persist(&self) -> Result<(), Error> {
+        catalog::save_persisted(&self.config_dir, &self.loaded, &self.persist_intent)
+            .map_err(Error::Message)
     }
 
     pub fn refresh_catalog_entries(&mut self) -> Result<(), Error> {
@@ -282,7 +335,48 @@ impl CatalogList {
             self.loaded.insert(file.id.clone());
         }
         self.reload();
-        let _ = self.persist_catalogs();
+        let _ = self.persist();
+    }
+
+    fn save_package(&mut self, path: &std::path::Path, package: &Package) -> Result<(), Error> {
+        let file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("catalog");
+        self.status = Some(
+            match catalog::append_local_package(path, package).map_err(Error::Message)? {
+                catalog::Append::Added => format!("saved {} to {file}", package.name),
+                catalog::Append::AlreadyPresent => format!("already in {file}"),
+            },
+        );
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.loaded.insert(CatalogId::Local(path));
+        self.reload();
+        self.persist()
+    }
+
+    fn begin_save_row(&mut self) -> Result<Option<Page>, Error> {
+        let Some(package) = self.current_package().cloned() else {
+            return Ok(None);
+        };
+        let paths: Vec<PathBuf> = catalog::local_files(&self.catalog_entries)
+            .into_iter()
+            .filter_map(|file| file.path().map(std::path::Path::to_path_buf))
+            .collect();
+        match paths.as_slice() {
+            [] => {
+                self.status = Some("no local catalog. press c then n".into());
+                Ok(None)
+            }
+            [path] => {
+                self.save_package(path, &package)?;
+                Ok(None)
+            }
+            _ => {
+                self.set_save_cursor(0);
+                Ok(Some(Page::SaveRow { package }))
+            }
+        }
     }
 
     fn handle_catalog_key(&mut self, key: KeyEvent) -> CatalogsAction {
@@ -327,7 +421,46 @@ impl CatalogList {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> PickAction {
+    fn handle_save_row_key(&mut self, key: KeyEvent) -> SaveRowAction {
+        match key.code {
+            KeyCode::Esc => SaveRowAction::Cancel,
+            KeyCode::Char('q') => SaveRowAction::Abort,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                SaveRowAction::Abort
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => SaveRowAction::Save,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_save_cursor(1);
+                SaveRowAction::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_save_cursor(-1);
+                SaveRowAction::Continue
+            }
+            KeyCode::PageDown => {
+                self.scroll_save(self.save_rows.max(1) as isize);
+                SaveRowAction::Continue
+            }
+            KeyCode::PageUp => {
+                self.scroll_save(-(self.save_rows.max(1) as isize));
+                SaveRowAction::Continue
+            }
+            KeyCode::Home => {
+                self.scroll_save(-(self.save_cursor as isize));
+                SaveRowAction::Continue
+            }
+            KeyCode::End => {
+                let last = catalog::local_files(&self.catalog_entries)
+                    .len()
+                    .saturating_sub(1);
+                self.scroll_save(last as isize - self.save_cursor as isize);
+                SaveRowAction::Continue
+            }
+            _ => SaveRowAction::Continue,
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Result<PickAction, Error> {
         if self.filtering {
             match key.code {
                 KeyCode::Esc => {
@@ -346,14 +479,20 @@ impl CatalogList {
                 }
                 _ => {}
             }
-            return PickAction::Continue;
+            return Ok(PickAction::Continue);
         }
-        match key.code {
+        Ok(match key.code {
             KeyCode::Char('q') => PickAction::Abort,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 PickAction::Abort
             }
             KeyCode::Char('c') => PickAction::Catalogs,
+            KeyCode::Char('s') => {
+                return Ok(match self.begin_save_row()? {
+                    Some(Page::SaveRow { package }) => PickAction::SaveRow { package },
+                    _ => PickAction::Continue,
+                });
+            }
             KeyCode::Char('/') => {
                 self.filtering = true;
                 PickAction::Continue
@@ -401,7 +540,7 @@ impl CatalogList {
             }
             KeyCode::Enter => PickAction::Confirm,
             _ => PickAction::Continue,
-        }
+        })
     }
 
     fn reset_pick_view(&mut self) {
@@ -444,23 +583,35 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
     ensure::ensure_cli_essentials(host)?;
 
     let config_dir = catalog::default_config_dir();
-    let loaded = catalog::load_persisted_catalogs(&config_dir);
-    let catalog = catalog::compose(&loaded).map_err(Error::Message)?;
-    let (desired, skipped) = load_brewfile(opts.brewfile.as_ref())?;
+    let persisted = catalog::load_persisted(&config_dir);
+    let catalog = catalog::compose(&persisted.catalogs).map_err(Error::Message)?;
+    let (brewfile, skipped) = load_brewfile(opts.brewfile.as_ref())?;
     if !skipped.is_empty() {
         println!(
             "ignored {} Brewfile line(s) (tap, vscode, and other v1 skips)",
             skipped.len()
         );
     }
-    let mut merged = catalog::merge(&catalog, &desired);
     let observed = host.installed()?;
     let universe = catalog::compose_all().map_err(Error::Message)?;
-    catalog::include_observed(&mut merged, &observed, &universe, false);
-    catalog::preselect_installed(&mut merged.selection, &observed, None);
+    let mut merged = catalog::assemble(
+        &catalog,
+        &brewfile,
+        &persisted.intent,
+        &observed,
+        &universe,
+        false,
+    );
 
     if opts.yes {
-        return apply(host, &merged.packages, &merged.selection, &observed);
+        return persist_and_apply(
+            host,
+            &config_dir,
+            &persisted.catalogs,
+            &merged.packages,
+            &merged.selection,
+            &observed,
+        );
     }
     if !io::stdout().is_terminal() {
         return Err(Error::Message(
@@ -472,25 +623,32 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
     catalog::apply_facts(&mut merged.packages, &facts);
 
     let catalog_pkg_ids = catalog.iter().map(|p| p.id.clone()).collect();
+    let mut desired = persisted.intent.desired();
+    desired.extend(brewfile);
     let mut list = CatalogList {
         packages: merged.packages,
         selection: merged.selection,
         observed: observed.clone(),
-        loaded,
+        loaded: persisted.catalogs,
         catalog_pkg_ids,
         desired,
+        persist_intent: persisted.intent,
         cursor: 0,
         catalog_cursor: 0,
+        save_cursor: 0,
         catalog_entries: catalog::all_entries(&config_dir).map_err(Error::Message)?,
         config_dir,
         facts,
         filter: String::new(),
         filtering: false,
         show_all_installed: false,
+        status: None,
         list_state: ListState::default(),
         catalog_list_state: ListState::default(),
+        save_list_state: ListState::default(),
         pick_rows: 10,
         catalog_rows: 10,
+        save_rows: 10,
     };
     loop {
         let confirmed = pick(&mut list)?;
@@ -611,6 +769,19 @@ fn apply(
     Ok(0)
 }
 
+fn persist_and_apply(
+    host: &impl Host,
+    config_dir: &std::path::Path,
+    catalogs: &HashSet<CatalogId>,
+    packages: &[Package],
+    selection: &Selection,
+    observed: &Observed,
+) -> Result<i32, Error> {
+    let intent = catalog::PersistIntent::Recorded(catalog::checked_desired(packages, selection));
+    catalog::save_persisted(config_dir, catalogs, &intent).map_err(Error::Message)?;
+    apply(host, packages, selection, observed)
+}
+
 fn pick(list: &mut CatalogList) -> Result<bool, Error> {
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture).map_err(Error::from)?;
@@ -624,24 +795,26 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
     let mut page = Page::Pick;
     loop {
         terminal
-            .draw(|frame| match page {
+            .draw(|frame| match &page {
                 Page::Pick => draw_pick(frame, list),
                 Page::Catalogs => draw_catalogs(frame, list),
+                Page::SaveRow { package } => draw_save_row(frame, list, package),
                 Page::Confirm => draw_confirm(frame, list),
             })
             .map_err(|e| Error::Message(e.to_string()))?;
         match event::read().map_err(Error::from)? {
-            Event::Key(key) if actionable_key(&key) => match page {
-                Page::Pick => match list.handle_key(key) {
+            Event::Key(key) if actionable_key(&key) => match page.clone() {
+                Page::Pick => match list.handle_key(key)? {
                     PickAction::Continue => {}
                     PickAction::Catalogs => page = Page::Catalogs,
+                    PickAction::SaveRow { package } => page = Page::SaveRow { package },
                     PickAction::Confirm => page = Page::Confirm,
                     PickAction::Abort => return Ok(false),
                 },
                 Page::Catalogs => match list.handle_catalog_key(key) {
                     CatalogsAction::Continue => {}
                     CatalogsAction::Done => {
-                        if let Err(err) = list.persist_catalogs() {
+                        if let Err(err) = list.persist() {
                             eprintln!("{err}");
                         }
                         page = Page::Pick;
@@ -654,7 +827,7 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
                                 list.loaded.insert(CatalogId::Local(path));
                                 list.refresh_catalog_entries()?;
                                 list.reload();
-                                let _ = list.persist_catalogs();
+                                let _ = list.persist();
                             }
                             Err(err) => eprintln!("{err}"),
                         }
@@ -663,8 +836,30 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
                     }
                     CatalogsAction::Abort => return Ok(false),
                 },
+                Page::SaveRow { package } => match list.handle_save_row_key(key) {
+                    SaveRowAction::Continue => {}
+                    SaveRowAction::Save => {
+                        let path = catalog::local_files(&list.catalog_entries)
+                            .get(list.save_cursor)
+                            .and_then(|file| file.path())
+                            .map(std::path::Path::to_path_buf);
+                        if let Some(path) = path {
+                            let package = package.clone();
+                            list.save_package(&path, &package)?;
+                            page = Page::Pick;
+                        }
+                    }
+                    SaveRowAction::Cancel => page = Page::Pick,
+                    SaveRowAction::Abort => return Ok(false),
+                },
                 Page::Confirm => match key.code {
-                    KeyCode::Enter => return Ok(true),
+                    KeyCode::Enter => {
+                        list.persist_intent = catalog::PersistIntent::Recorded(
+                            catalog::checked_desired(&list.packages, &list.selection),
+                        );
+                        list.persist()?;
+                        return Ok(true);
+                    }
                     KeyCode::Esc => page = Page::Pick,
                     KeyCode::Char('q') => return Ok(false),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -674,14 +869,16 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
                 },
             },
             Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollDown => match page {
+                MouseEventKind::ScrollDown => match page.clone() {
                     Page::Pick => list.nudge_pick(1),
                     Page::Catalogs => list.nudge_catalogs(1),
+                    Page::SaveRow { .. } => list.move_save_cursor(1),
                     Page::Confirm => {}
                 },
-                MouseEventKind::ScrollUp => match page {
+                MouseEventKind::ScrollUp => match page.clone() {
                     Page::Pick => list.nudge_pick(-1),
                     Page::Catalogs => list.nudge_catalogs(-1),
+                    Page::SaveRow { .. } => list.move_save_cursor(-1),
                     Page::Confirm => {}
                 },
                 _ => {}
@@ -767,10 +964,49 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &mut CatalogList) {
     frame.render_stateful_widget(widget, areas[0], &mut list.list_state);
     frame.render_widget(
         Paragraph::new(
-            "space toggle  a all  n none  o all installed  / filter  c catalogs  enter confirm  q abort",
+            match &list.status {
+                Some(status) => format!(
+                    "space toggle  a all  n none  o all installed  / filter  c catalogs  s save to catalog  enter confirm  q abort  · {status}"
+                ),
+                None => "space toggle  a all  n none  o all installed  / filter  c catalogs  s save to catalog  enter confirm  q abort".into(),
+            },
         ),
         areas[1],
     );
+}
+
+fn draw_save_row(frame: &mut ratatui::Frame, list: &mut CatalogList, package: &Package) {
+    let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
+    list.save_rows = areas[0].height.saturating_sub(2).max(1) as usize;
+    let items: Vec<ListItem> = catalog::local_files(&list.catalog_entries)
+        .into_iter()
+        .map(|file| {
+            let doc = file.doc().expect("local catalogs parse");
+            let filename = file
+                .path()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("catalog");
+            ListItem::new(Line::from(format!(
+                "{} {} {}",
+                cell(filename, 24),
+                cell(&doc.title, 24),
+                doc.description.as_deref().unwrap_or("")
+            )))
+        })
+        .collect();
+    let has_items = !items.is_empty();
+    let widget = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Save {}", package.title)),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    list.save_list_state
+        .select(has_items.then_some(list.save_cursor));
+    frame.render_stateful_widget(widget, areas[0], &mut list.save_list_state);
+    frame.render_widget(Paragraph::new("enter save  esc back"), areas[1]);
 }
 
 fn draw_catalogs(frame: &mut ratatui::Frame, list: &mut CatalogList) {
@@ -904,18 +1140,23 @@ mod tests {
             loaded,
             catalog_pkg_ids,
             desired: Desired::new(),
+            persist_intent: catalog::PersistIntent::Absent,
             cursor: 0,
             catalog_cursor: 0,
+            save_cursor: 0,
             catalog_entries: catalog::all_entries(&config_dir).unwrap(),
             config_dir,
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
             show_all_installed: false,
+            status: None,
             list_state: ListState::default(),
             catalog_list_state: ListState::default(),
+            save_list_state: ListState::default(),
             pick_rows: 10,
             catalog_rows: 10,
+            save_rows: 10,
         }
     }
 
@@ -933,13 +1174,69 @@ mod tests {
     #[test]
     fn q_aborts_picker() {
         let mut l = list();
-        assert!(matches!(l.handle_key(key('q')), PickAction::Abort));
+        assert!(matches!(
+            l.handle_key(key('q')).unwrap(),
+            PickAction::Abort
+        ));
     }
 
     #[test]
     fn c_opens_catalogs() {
         let mut l = list();
-        assert!(matches!(l.handle_key(key('c')), PickAction::Catalogs));
+        assert!(matches!(
+            l.handle_key(key('c')).unwrap(),
+            PickAction::Catalogs
+        ));
+    }
+
+    #[test]
+    fn s_handles_zero_one_and_many_local_catalogs() {
+        let dir = std::env::temp_dir().join(format!("macstrap-save-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut l = list();
+        l.config_dir = dir.clone();
+        l.catalog_entries = catalog::all_entries(&dir).unwrap();
+        assert!(matches!(
+            l.handle_key(key('s')).unwrap(),
+            PickAction::Continue
+        ));
+        assert_eq!(
+            l.status.as_deref(),
+            Some("no local catalog. press c then n")
+        );
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+
+        let first = catalog::create_catalog(CreateCatalogInput {
+            filename: "first.yml".into(),
+            title: "First".into(),
+            description: None,
+            location: dir.clone(),
+        })
+        .unwrap();
+        l.refresh_catalog_entries().unwrap();
+        assert!(matches!(
+            l.handle_key(key('s')).unwrap(),
+            PickAction::Continue
+        ));
+        let doc = catalog::load(&std::fs::read_to_string(&first).unwrap()).unwrap();
+        assert!(doc.packages.iter().any(|package| package.name == "ripgrep"));
+        assert_eq!(l.status.as_deref(), Some("saved ripgrep to first.yml"));
+
+        catalog::create_catalog(CreateCatalogInput {
+            filename: "second.yml".into(),
+            title: "Second".into(),
+            description: None,
+            location: dir.clone(),
+        })
+        .unwrap();
+        l.refresh_catalog_entries().unwrap();
+        let expected = l.current_package().unwrap().name.clone();
+        let PickAction::SaveRow { package } = l.handle_key(key('s')).unwrap() else {
+            panic!("many local catalogs must open the save page");
+        };
+        assert_eq!(package.name, expected);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn live_list() -> CatalogList {
@@ -955,18 +1252,23 @@ mod tests {
             loaded,
             catalog_pkg_ids,
             desired: Desired::new(),
+            persist_intent: catalog::PersistIntent::Absent,
             cursor: 0,
             catalog_cursor: 0,
+            save_cursor: 0,
             catalog_entries: catalog::all_entries(&config_dir).unwrap(),
             config_dir,
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
             show_all_installed: false,
+            status: None,
             list_state: ListState::default(),
             catalog_list_state: ListState::default(),
+            save_list_state: ListState::default(),
             pick_rows: 10,
             catalog_rows: 10,
+            save_rows: 10,
         }
     }
 
@@ -1114,6 +1416,50 @@ mod tests {
     }
 
     #[test]
+    fn persist_and_apply_records_selection_before_changes() {
+        let dir = std::env::temp_dir().join(format!("macstrap-apply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = ensure::FakeHost::default();
+        let installed = pkg("ripgrep");
+        let extra = pkg("wget");
+        host.installed.borrow_mut().insert(installed.id.clone());
+        let packages = vec![installed.clone(), extra.clone()];
+        let selection =
+            Selection::from([(installed.id.clone(), false), (extra.id.clone(), true)]);
+        let observed = host.installed().unwrap();
+
+        persist_and_apply(
+            &host,
+            &dir,
+            &catalog::default_loaded(),
+            &packages,
+            &selection,
+            &observed,
+        )
+        .unwrap();
+
+        assert_eq!(*host.uninstalls.borrow(), vec![installed.id]);
+        assert_eq!(*host.installs.borrow(), vec![extra.id.clone()]);
+        let config = std::fs::read_to_string(dir.join("config.yml")).unwrap();
+        assert!(config.contains(extra.id.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn applying_the_same_selection_twice_converges() {
+        let host = ensure::FakeHost::default();
+        let rg = pkg("ripgrep");
+        host.installed.borrow_mut().insert(rg.id.clone());
+        let packages = vec![rg.clone()];
+        let selection = Selection::from([(rg.id.clone(), false)]);
+        let observed = host.installed().unwrap();
+        apply(&host, &packages, &selection, &observed).unwrap();
+        let observed = host.installed().unwrap();
+        apply(&host, &packages, &selection, &observed).unwrap();
+        assert_eq!(*host.uninstalls.borrow(), vec![rg.id]);
+    }
+
+    #[test]
     fn observed_optional_catalog_survives_reload() {
         let mut l = live_list();
         let node_id = PkgId::new(Kind::Formula, "node", None);
@@ -1128,22 +1474,25 @@ mod tests {
         let mut l = live_list();
         let unknown = PkgId::new(Kind::Formula, "macstrap-unknown-formula", None);
         l.observed.insert(unknown.clone());
-        assert!(!l
-            .packages
-            .iter()
-            .any(|p| p.name == "macstrap-unknown-formula"));
+        assert!(
+            !l.packages
+                .iter()
+                .any(|p| p.name == "macstrap-unknown-formula")
+        );
         l.toggle_show_all_installed();
         assert!(l.show_all_installed);
-        assert!(l
-            .packages
-            .iter()
-            .any(|p| p.name == "macstrap-unknown-formula"));
+        assert!(
+            l.packages
+                .iter()
+                .any(|p| p.name == "macstrap-unknown-formula")
+        );
         l.toggle_show_all_installed();
         assert!(!l.show_all_installed);
-        assert!(!l
-            .packages
-            .iter()
-            .any(|p| p.name == "macstrap-unknown-formula"));
+        assert!(
+            !l.packages
+                .iter()
+                .any(|p| p.name == "macstrap-unknown-formula")
+        );
     }
 
     #[test]
@@ -1228,18 +1577,23 @@ mod tests {
             loaded,
             catalog_pkg_ids: HashSet::new(),
             desired: Desired::new(),
+            persist_intent: catalog::PersistIntent::Absent,
             cursor,
             catalog_cursor: 0,
+            save_cursor: 0,
             catalog_entries: catalog::all_entries(&config_dir).unwrap(),
             config_dir,
             facts: HashMap::new(),
             filter: String::new(),
             filtering: false,
             show_all_installed: false,
+            status: None,
             list_state: ListState::default(),
             catalog_list_state: ListState::default(),
+            save_list_state: ListState::default(),
             pick_rows: 10,
             catalog_rows: 10,
+            save_rows: 10,
         }
     }
 
@@ -1255,8 +1609,8 @@ mod tests {
 
     #[test]
     fn pick_list_scrolls_to_cursor() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut list = long_pick_list(30, 25);
         let backend = TestBackend::new(80, 12);
@@ -1276,8 +1630,8 @@ mod tests {
 
     #[test]
     fn pick_list_page_down_scrolls_viewport() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut list = long_pick_list(80, 0);
         let backend = TestBackend::new(80, 40);
@@ -1298,23 +1652,27 @@ mod tests {
         let mut l = long_pick_list(30, 0);
         l.pick_rows = 10;
         assert!(matches!(
-            l.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            l.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+                .unwrap(),
             PickAction::Continue
         ));
         assert_eq!(l.cursor, 10);
         assert!(matches!(
-            l.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            l.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+                .unwrap(),
             PickAction::Continue
         ));
         assert_eq!(l.cursor, 29);
         assert!(matches!(
-            l.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            l.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+                .unwrap(),
             PickAction::Continue
         ));
         assert_eq!(l.cursor, 0);
         l.cursor = 15;
         assert!(matches!(
-            l.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            l.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+                .unwrap(),
             PickAction::Continue
         ));
         assert_eq!(l.cursor, 5);
@@ -1340,6 +1698,6 @@ mod tests {
         assert!(merged.selection[&PkgId::new(Kind::Formula, "git", None)]);
         assert!(merged.selection[&PkgId::new(Kind::Cask, "visual-studio-code", None)]);
         assert!(merged.selection[&PkgId::new(Kind::Mas, "Yoink", Some(457622435))]);
-        assert!(!merged.selection[&PkgId::new(Kind::Formula, "fzf", None)]);
+        assert!(merged.selection[&PkgId::new(Kind::Formula, "fzf", None)]);
     }
 }

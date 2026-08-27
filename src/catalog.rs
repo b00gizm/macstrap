@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Formula,
@@ -142,7 +144,10 @@ pub fn discover_local(config_dir: &Path) -> Result<Vec<CatalogFile>, String> {
         if ext != "yml" && ext != "yaml" {
             continue;
         }
-        if path.file_name().is_some_and(|n| n == "config.yml" || n == "config.yaml") {
+        if path
+            .file_name()
+            .is_some_and(|n| n == "config.yml" || n == "config.yaml")
+        {
             continue;
         }
         let path = path.canonicalize().unwrap_or(path);
@@ -163,10 +168,7 @@ pub fn discover_local(config_dir: &Path) -> Result<Vec<CatalogFile>, String> {
 }
 
 pub fn all_entries(config_dir: &Path) -> Result<Vec<CatalogEntry>, String> {
-    let mut all: Vec<CatalogEntry> = FILES
-        .iter()
-        .map(|f| CatalogEntry::Builtin(f))
-        .collect();
+    let mut all: Vec<CatalogEntry> = FILES.iter().map(|f| CatalogEntry::Builtin(f)).collect();
     for local in discover_local(config_dir)? {
         all.push(CatalogEntry::Owned(local));
     }
@@ -228,25 +230,21 @@ pub fn create_catalog(input: CreateCatalogInput) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(&input.location)
         .map_err(|e| format!("{}: {e}", input.location.display()))?;
-    #[derive(Serialize)]
-    struct NewCatalog<'a> {
-        title: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        description: Option<&'a str>,
-        packages: Vec<serde_yaml::Value>,
-    }
-    let doc = NewCatalog {
-        title: &input.title,
-        description: input.description.as_deref().filter(|d| !d.is_empty()),
+    let doc = CatalogDoc {
+        title: input.title,
+        description: input.description.filter(|d| !d.is_empty()),
         packages: Vec::new(),
     };
-    let yaml = serde_yaml::to_string(&doc).map_err(|e| format!("catalog: {e}"))?;
-    std::fs::write(&path, yaml).map_err(|e| format!("{}: {e}", path.display()))?;
+    write_catalog_doc(&path, &doc)?;
     Ok(path.canonicalize().unwrap_or(path))
 }
 
 pub fn default_loaded() -> HashSet<CatalogId> {
-    FILES.iter().filter(|f| f.required).map(|f| f.id.clone()).collect()
+    FILES
+        .iter()
+        .filter(|f| f.required)
+        .map(|f| f.id.clone())
+        .collect()
 }
 
 pub fn is_required_catalog(id: &CatalogId) -> bool {
@@ -300,38 +298,99 @@ fn parse_persisted_catalog(key: &str, config_dir: &Path) -> Option<CatalogId> {
 struct PersistedConfig {
     #[serde(default)]
     catalogs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desired: Option<Vec<String>>,
 }
 
-pub fn load_persisted_catalogs(config_dir: &Path) -> HashSet<CatalogId> {
-    let mut loaded = default_loaded();
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PersistIntent {
+    Absent,
+    Recorded(Desired),
+}
+
+impl PersistIntent {
+    pub fn desired(&self) -> Desired {
+        match self {
+            Self::Absent => Desired::new(),
+            Self::Recorded(desired) => desired.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Persisted {
+    pub catalogs: HashSet<CatalogId>,
+    pub intent: PersistIntent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Append {
+    Added,
+    AlreadyPresent,
+}
+
+pub fn load_persisted(config_dir: &Path) -> Persisted {
+    let mut catalogs = default_loaded();
     let path = config_dir.join("config.yml");
     let Ok(yaml) = std::fs::read_to_string(&path) else {
-        return loaded;
+        return Persisted {
+            catalogs,
+            intent: PersistIntent::Absent,
+        };
     };
     let Ok(config) = serde_yaml::from_str::<PersistedConfig>(&yaml) else {
-        return loaded;
+        return Persisted {
+            catalogs,
+            intent: PersistIntent::Absent,
+        };
     };
     for key in config.catalogs {
         if let Some(id) = parse_persisted_catalog(&key, config_dir) {
             if !is_required_catalog(&id) {
-                loaded.insert(id);
+                catalogs.insert(id);
             }
         }
     }
-    loaded
+    let intent = match config.desired {
+        None => PersistIntent::Absent,
+        Some(ids) => PersistIntent::Recorded(
+            ids.into_iter()
+                .filter_map(|raw| PkgId::parse(&raw))
+                .filter(|id| !is_protected(id))
+                .map(|id| {
+                    let package = stub_from_id(&id);
+                    (id, package)
+                })
+                .collect(),
+        ),
+    };
+    Persisted { catalogs, intent }
 }
 
-pub fn save_persisted_catalogs(config_dir: &Path, loaded: &HashSet<CatalogId>) -> Result<(), String> {
+pub fn save_persisted(
+    config_dir: &Path,
+    catalogs: &HashSet<CatalogId>,
+    intent: &PersistIntent,
+) -> Result<(), String> {
     std::fs::create_dir_all(config_dir).map_err(|e| format!("{}: {e}", config_dir.display()))?;
-    let mut catalogs: Vec<String> = loaded
-        .iter()
-        .filter_map(catalog_persist_key)
-        .collect();
+    let mut catalogs: Vec<String> = catalogs.iter().filter_map(catalog_persist_key).collect();
     catalogs.sort();
-    let yaml = serde_yaml::to_string(&PersistedConfig { catalogs })
-        .map_err(|e| format!("config: {e}"))?;
-    std::fs::write(config_dir.join("config.yml"), yaml)
-        .map_err(|e| format!("{}: {e}", config_dir.join("config.yml").display()))
+    let desired = match intent {
+        PersistIntent::Absent => None,
+        PersistIntent::Recorded(desired) => {
+            let mut ids: Vec<String> = desired
+                .keys()
+                .filter(|id| !is_protected(id))
+                .map(|id| id.as_str().to_string())
+                .collect();
+            ids.sort();
+            Some(ids)
+        }
+    };
+    write_yaml_atomically(
+        &config_dir.join("config.yml"),
+        &PersistedConfig { catalogs, desired },
+    )
 }
 
 static PROTECTED: LazyLock<HashSet<PkgId>> = LazyLock::new(|| {
@@ -358,6 +417,21 @@ impl PkgId {
             (Kind::Formula, _) => Self(format!("formula:{name}")),
             (Kind::Cask, _) => Self(format!("cask:{name}")),
         }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        if let Some(name) = raw.strip_prefix("formula:").filter(|name| !name.is_empty()) {
+            return Some(Self::new(Kind::Formula, name, None));
+        }
+        if let Some(name) = raw.strip_prefix("cask:").filter(|name| !name.is_empty()) {
+            return Some(Self::new(Kind::Cask, name, None));
+        }
+        let id = raw.strip_prefix("mas:")?.parse().ok()?;
+        Some(Self::new(Kind::Mas, raw, Some(id)))
     }
 }
 
@@ -393,24 +467,37 @@ pub struct CatalogDoc {
     pub packages: Catalog,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CatalogYaml {
     title: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     packages: Vec<CatalogRow>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CatalogRow {
     kind: Kind,
     name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     mas_id: Option<u64>,
     title: String,
     category: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+}
+
+impl From<&Package> for CatalogRow {
+    fn from(package: &Package) -> Self {
+        Self {
+            kind: package.kind,
+            name: package.name.clone(),
+            mas_id: package.mas_id,
+            title: package.title.clone(),
+            category: package.category.clone(),
+            description: package.description.clone(),
+        }
+    }
 }
 
 impl From<CatalogRow> for Package {
@@ -487,7 +574,10 @@ pub fn merge(catalog: &[Package], desired: &Desired) -> Merge {
     let mut packages = catalog.to_vec();
     let mut selection = Selection::new();
     for pkg in &packages {
-        selection.insert(pkg.id.clone(), desired.contains_key(&pkg.id));
+        selection.insert(
+            pkg.id.clone(),
+            desired.contains_key(&pkg.id) || is_protected(&pkg.id),
+        );
     }
     for (id, pkg) in desired {
         if !packages.iter().any(|p| &p.id == id) {
@@ -504,6 +594,142 @@ pub fn merge(catalog: &[Package], desired: &Desired) -> Merge {
         packages,
         selection,
     }
+}
+
+pub fn checked_desired(packages: &[Package], selection: &Selection) -> Desired {
+    packages
+        .iter()
+        .filter(|pkg| selection.get(&pkg.id).copied().unwrap_or(false) && !is_protected(&pkg.id))
+        .map(|pkg| (pkg.id.clone(), pkg.clone()))
+        .collect()
+}
+
+fn union_desired(mut persist: Desired, brewfile: &Desired) -> Desired {
+    persist.extend(brewfile.clone());
+    persist
+}
+
+pub fn assemble(
+    catalog: &[Package],
+    brewfile: &Desired,
+    persist: &PersistIntent,
+    observed: &Observed,
+    universe: &[Package],
+    show_all_installed: bool,
+) -> Merge {
+    let desired = union_desired(persist.desired(), brewfile);
+    let mut merged = merge(catalog, &desired);
+    include_observed(&mut merged, observed, universe, show_all_installed);
+    if matches!(persist, PersistIntent::Absent) {
+        preselect_installed(&mut merged.selection, observed, None);
+    }
+    merged
+}
+
+pub fn local_files(entries: &[CatalogEntry]) -> Vec<&CatalogFile> {
+    let mut files: Vec<&CatalogFile> = entries
+        .iter()
+        .map(CatalogEntry::file)
+        .filter(|file| file.origin == Origin::Local)
+        .collect();
+    files.sort_by(|a, b| {
+        a.path()
+            .and_then(Path::file_name)
+            .cmp(&b.path().and_then(Path::file_name))
+    });
+    files
+}
+
+pub fn append_local_package(path: &Path, package: &Package) -> Result<Append, String> {
+    if !path.is_file() {
+        return Err(format!("{} is not an existing catalog", path.display()));
+    }
+    if path
+        .file_name()
+        .is_some_and(|name| name == "config.yml" || name == "config.yaml")
+    {
+        return Err("config.yml is not a catalog".into());
+    }
+    if !matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("yml" | "yaml")
+    ) {
+        return Err(format!("{} is not a YAML catalog", path.display()));
+    }
+    if package.kind == Kind::Mas && package.mas_id.is_none() {
+        return Err(format!(
+            "catalog: mas package {} requires mas_id",
+            package.title
+        ));
+    }
+    let yaml =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut doc = load(&yaml)?;
+    if doc
+        .packages
+        .iter()
+        .any(|existing| existing.id == package.id)
+    {
+        return Ok(Append::AlreadyPresent);
+    }
+    doc.packages.push(package.clone());
+    write_catalog_doc(path, &doc)?;
+    Ok(Append::Added)
+}
+
+fn write_catalog_doc(path: &Path, doc: &CatalogDoc) -> Result<(), String> {
+    let yaml = CatalogYaml {
+        title: doc.title.clone(),
+        description: doc.description.clone(),
+        packages: doc.packages.iter().map(CatalogRow::from).collect(),
+    };
+    write_yaml_atomically(path, &yaml)
+}
+
+fn write_yaml_atomically<T: Serialize>(path: &Path, document: &T) -> Result<(), String> {
+    let yaml = serde_yaml::to_string(document).map_err(|error| format!("yaml: {error}"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("macstrap");
+    let mut attempt = 0;
+    let (temporary, mut file) = loop {
+        let temporary = parent.join(format!(
+            ".{filename}.{}.{}.tmp",
+            std::process::id(),
+            attempt
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(error) => return Err(format!("{}: {error}", temporary.display())),
+        }
+    };
+    let result = (|| {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            file.set_permissions(metadata.permissions())
+                .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        }
+        file.write_all(yaml.as_bytes())
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        std::fs::rename(&temporary, path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("{}: {error}", parent.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn include_observed(
@@ -963,10 +1189,7 @@ packages:
             infer_title_from_filename("foo-essentials.yaml"),
             "Foo Essentials"
         );
-        assert_eq!(
-            infer_title_from_filename("my_custom.yml"),
-            "My Custom"
-        );
+        assert_eq!(infer_title_from_filename("my_custom.yml"), "My Custom");
     }
 
     #[test]
@@ -989,7 +1212,9 @@ packages:
     }
 
     #[test]
-    fn persisted_catalogs_roundtrip() {
+    fn persisted_state_roundtrips_catalogs_and_desired() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = std::env::temp_dir().join(format!("macstrap-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1004,18 +1229,39 @@ packages:
         loaded.insert(CatalogId::NodeEssentials);
         loaded.insert(CatalogId::RustFull);
         loaded.insert(CatalogId::Local(path.clone()));
-        save_persisted_catalogs(&dir, &loaded).unwrap();
-        let yaml = std::fs::read_to_string(dir.join("config.yml")).unwrap();
+        let desired = Desired::from([(
+            PkgId::new(Kind::Formula, "ripgrep", None),
+            pkg(Kind::Formula, "ripgrep", None),
+        )]);
+        save_persisted(&dir, &loaded, &PersistIntent::Recorded(desired)).unwrap();
+        let config_path = dir.join("config.yml");
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let restored = load_persisted(&dir);
+        save_persisted(&dir, &restored.catalogs, &restored.intent).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let yaml = std::fs::read_to_string(&config_path).unwrap();
         assert!(yaml.contains("catalogs:"));
         assert!(yaml.contains("node-essentials"));
         assert!(yaml.contains("rust-full"));
         assert!(!yaml.contains("cli-essentials"));
         assert!(yaml.contains(&path.display().to_string()));
-        let restored = load_persisted_catalogs(&dir);
-        assert!(restored.contains(&CatalogId::CliEssentials));
-        assert!(restored.contains(&CatalogId::NodeEssentials));
-        assert!(restored.contains(&CatalogId::RustFull));
-        assert!(restored.contains(&CatalogId::Local(path)));
+        assert!(yaml.contains("formula:ripgrep"));
+        let restored = load_persisted(&dir);
+        assert!(restored.catalogs.contains(&CatalogId::CliEssentials));
+        assert!(restored.catalogs.contains(&CatalogId::NodeEssentials));
+        assert!(restored.catalogs.contains(&CatalogId::RustFull));
+        assert!(restored.catalogs.contains(&CatalogId::Local(path)));
+        let PersistIntent::Recorded(desired) = restored.intent else {
+            panic!("desired must be recorded");
+        };
+        assert!(desired.contains_key(&PkgId::new(Kind::Formula, "ripgrep", None)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1026,13 +1272,150 @@ packages:
         std::fs::create_dir_all(&dir).unwrap();
         let mut loaded = default_loaded();
         loaded.insert(CatalogId::PythonEssentials);
-        save_persisted_catalogs(&dir, &loaded).unwrap();
+        save_persisted(&dir, &loaded, &PersistIntent::Absent).unwrap();
         let entries = all_entries(&dir).unwrap();
         assert!(
             entries
                 .iter()
                 .all(|e| e.file().path() != Some(dir.join("config.yml").as_path()))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_missing_and_empty_desired_have_different_intents() {
+        let dir = std::env::temp_dir().join(format!("macstrap-intent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(load_persisted(&dir).intent, PersistIntent::Absent));
+        std::fs::write(dir.join("config.yml"), "catalogs: []\n").unwrap();
+        assert!(matches!(load_persisted(&dir).intent, PersistIntent::Absent));
+        std::fs::write(dir.join("config.yml"), "catalogs: []\ndesired: []\n").unwrap();
+        assert!(matches!(
+            load_persisted(&dir).intent,
+            PersistIntent::Recorded(desired) if desired.is_empty()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_ids_are_valid_sorted_and_exclude_protected() {
+        let dir = std::env::temp_dir().join(format!("macstrap-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = pkg(Kind::Formula, "git", None);
+        let rg = pkg(Kind::Formula, "ripgrep", None);
+        let code = pkg(Kind::Cask, "visual-studio-code", None);
+        let desired = Desired::from([
+            (git.id.clone(), git),
+            (rg.id.clone(), rg),
+            (code.id.clone(), code),
+        ]);
+        save_persisted(&dir, &default_loaded(), &PersistIntent::Recorded(desired)).unwrap();
+        let yaml = std::fs::read_to_string(dir.join("config.yml")).unwrap();
+        assert!(!yaml.contains("formula:git"));
+        assert!(yaml.find("cask:visual-studio-code") < yaml.find("formula:ripgrep"));
+        std::fs::write(
+            dir.join("config.yml"),
+            "catalogs: []\ndesired:\n  - nope\n  - mas:not-a-number\n  - formula:ripgrep\n",
+        )
+        .unwrap();
+        let PersistIntent::Recorded(desired) = load_persisted(&dir).intent else {
+            panic!("desired must be recorded");
+        };
+        assert_eq!(desired.len(), 1);
+        assert!(desired.contains_key(&PkgId::new(Kind::Formula, "ripgrep", None)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assemble_preselects_only_when_persist_is_absent() {
+        let rg = pkg(Kind::Formula, "ripgrep", None);
+        let observed = Observed::from([rg.id.clone()]);
+        let absent = assemble(
+            std::slice::from_ref(&rg),
+            &Desired::new(),
+            &PersistIntent::Absent,
+            &observed,
+            &[],
+            false,
+        );
+        assert!(absent.selection[&rg.id]);
+        let recorded = assemble(
+            std::slice::from_ref(&rg),
+            &Desired::new(),
+            &PersistIntent::Recorded(Desired::new()),
+            &observed,
+            &[],
+            false,
+        );
+        assert!(!recorded.selection[&rg.id]);
+    }
+
+    #[test]
+    fn checked_desired_omits_protected_and_merge_restores_them() {
+        let git = pkg(Kind::Formula, "git", None);
+        let rg = pkg(Kind::Formula, "ripgrep", None);
+        let packages = vec![git.clone(), rg.clone()];
+        let selection = Selection::from([(git.id.clone(), true), (rg.id.clone(), true)]);
+        let desired = checked_desired(&packages, &selection);
+        assert!(!desired.contains_key(&git.id));
+        assert!(desired.contains_key(&rg.id));
+        let merged = merge(&packages, &Desired::new());
+        assert!(merged.selection[&git.id]);
+        assert!(!merged.selection[&rg.id]);
+    }
+
+    #[test]
+    fn append_local_package_is_idempotent_and_preserves_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!("macstrap-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = create_catalog(CreateCatalogInput {
+            filename: "mine.yml".into(),
+            title: "Mine".into(),
+            description: Some("Personal tools".into()),
+            location: dir.clone(),
+        })
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let package = pkg(Kind::Formula, "ripgrep", None);
+        assert_eq!(
+            append_local_package(&path, &package).unwrap(),
+            Append::Added
+        );
+        let first = std::fs::read(&path).unwrap();
+        assert_eq!(
+            append_local_package(&path, &package).unwrap(),
+            Append::AlreadyPresent
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        let doc = load(std::str::from_utf8(&first).unwrap()).unwrap();
+        assert_eq!(doc.packages, vec![package]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_files_excludes_builtins_and_sorts_by_filename() {
+        let dir = std::env::temp_dir().join(format!("macstrap-locals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for filename in ["z.yml", "a.yml"] {
+            create_catalog(CreateCatalogInput {
+                filename: filename.into(),
+                title: filename.into(),
+                description: None,
+                location: dir.clone(),
+            })
+            .unwrap();
+        }
+        let entries = all_entries(&dir).unwrap();
+        let names: Vec<&str> = local_files(&entries)
+            .into_iter()
+            .map(|file| file.path().unwrap().file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["a.yml", "z.yml"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1049,8 +1432,7 @@ packages:
         .unwrap();
         let entries = all_entries(&dir).unwrap();
         assert!(entries.iter().any(|e| {
-            e.file().origin == Origin::Local
-                && e.file().path() == Some(path.as_path())
+            e.file().origin == Origin::Local && e.file().path() == Some(path.as_path())
         }));
         let _ = std::fs::remove_dir_all(&dir);
     }
