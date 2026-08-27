@@ -50,8 +50,6 @@ Press `s` on a tool to append it to an existing local catalog. One local catalog
 
 Descriptions are optional. An empty description stays blank. A formula or cask without one uses `brew info`. That same call fills the installed and available version columns.
 
-The tool does not change your login shell unless it is still bash.
-
 ## Brewfile
 
 v1 reads `brew "name"`, `cask "name"`, and `mas "Title", id: 123`. Other lines are skipped and counted.

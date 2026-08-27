@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Checked package persistence for repeatable confirmed and `--yes` runs.
-- Picker shortcut to append the current package to a local catalog.
+- Confirmed and `--yes` runs write the checked set to `desired` in `~/.config/macstrap/config.yml`.
+- `s` in the picker appends the current package to an existing local catalog.
 
 ## [0.2.0] - 2026-08-27
 
@@ -50,5 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bundled `cli-essentials.yml` catalog (git, gh, fd, fzf, jq).
 - curl installer script and GitHub Actions release workflow for macOS arm64 and amd64.
 
+[Unreleased]: https://github.com/b00gizm/macstrap/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/b00gizm/macstrap/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/b00gizm/macstrap/releases/tag/v0.1.0
