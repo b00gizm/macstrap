@@ -432,10 +432,20 @@ impl From<CatalogRow> for Package {
 
 pub fn load(yaml: &str) -> Result<CatalogDoc, String> {
     let doc: CatalogYaml = serde_yaml::from_str(yaml).map_err(|e| format!("catalog: {e}"))?;
+    let mut packages = Vec::with_capacity(doc.packages.len());
+    for row in doc.packages {
+        if row.kind == Kind::Mas && row.mas_id.is_none() {
+            return Err(format!(
+                "catalog: mas package {} requires mas_id",
+                row.title
+            ));
+        }
+        packages.push(Package::from(row));
+    }
     Ok(CatalogDoc {
         title: doc.title,
         description: doc.description,
-        packages: doc.packages.into_iter().map(Package::from).collect(),
+        packages,
     })
 }
 
@@ -666,6 +676,62 @@ mod tests {
             1,
             "node from essentials and full must collapse to one row"
         );
+    }
+
+    #[test]
+    fn yaml_mas_parses_with_mas_id() {
+        let doc = load(
+            r#"
+title: Mac App Store essentials
+packages:
+  - name: Yoink
+    kind: mas
+    mas_id: 457622435
+    title: Yoink
+    category: Utilities
+"#,
+        )
+        .unwrap();
+        let pkg = &doc.packages[0];
+        assert_eq!(pkg.kind, Kind::Mas);
+        assert_eq!(pkg.mas_id, Some(457622435));
+        assert_eq!(pkg.id, PkgId::new(Kind::Mas, "Yoink", Some(457622435)));
+    }
+
+    #[test]
+    fn yaml_mas_requires_mas_id() {
+        let err = load(
+            r#"
+title: Bad
+packages:
+  - name: Yoink
+    kind: mas
+    title: Yoink
+    category: Utilities
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("mas_id"), "{err}");
+    }
+
+    #[test]
+    fn mas_catalog_merges_into_picker() {
+        let doc = load(
+            r#"
+title: Mac App Store essentials
+packages:
+  - name: Fantastical
+    kind: mas
+    mas_id: 975937182
+    title: Fantastical
+    category: Productivity
+"#,
+        )
+        .unwrap();
+        let merged = merge(&doc.packages, &Desired::new());
+        let id = PkgId::new(Kind::Mas, "Fantastical", Some(975937182));
+        assert!(merged.packages.iter().any(|p| p.id == id));
+        assert!(!merged.selection[&id]);
     }
 
     #[test]
