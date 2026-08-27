@@ -3,12 +3,16 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::DefaultTerminal;
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
+use crossterm::execute;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::DefaultTerminal;
 
 use crate::brewfile;
 use crate::catalog::{
@@ -80,6 +84,10 @@ pub struct CatalogList {
     pub filtering: bool,
     pub show_all_installed: bool,
     pub catalog_pkg_ids: HashSet<PkgId>,
+    list_state: ListState,
+    catalog_list_state: ListState,
+    pick_rows: usize,
+    catalog_rows: usize,
 }
 
 impl CatalogList {
@@ -128,19 +136,99 @@ impl CatalogList {
     pub fn select_none(&mut self) {
         for i in self.visible() {
             let id = &self.packages[i].id;
-            self.selection
-                .insert(id.clone(), catalog::is_protected(id));
+            self.selection.insert(id.clone(), catalog::is_protected(id));
         }
     }
 
     fn move_cursor(&mut self, delta: isize) {
         let len = self.visible().len();
         if len == 0 {
-            self.cursor = 0;
+            self.set_pick_cursor(0);
             return;
         }
         let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, len as isize - 1) as usize;
+        self.set_pick_cursor(next.clamp(0, len as isize - 1) as usize);
+    }
+
+    fn set_pick_cursor(&mut self, index: usize) {
+        let len = self.visible().len();
+        if len == 0 {
+            self.cursor = 0;
+            self.list_state.select(None);
+            *self.list_state.offset_mut() = 0;
+            return;
+        }
+        self.cursor = index.min(len - 1);
+        self.list_state.select(Some(self.cursor));
+    }
+
+    fn max_pick_offset(&self) -> usize {
+        self.visible().len().saturating_sub(self.pick_rows.max(1))
+    }
+
+    fn scroll_pick(&mut self, delta: isize) {
+        let len = self.visible().len();
+        if len == 0 {
+            self.set_pick_cursor(0);
+            return;
+        }
+        let next = (self.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.set_pick_cursor(next);
+        *self.list_state.offset_mut() = next.min(self.max_pick_offset());
+    }
+
+    fn nudge_pick(&mut self, delta: isize) {
+        self.move_cursor(delta);
+        let max_off = self.max_pick_offset();
+        let off = (self.list_state.offset() as isize + delta).clamp(0, max_off as isize) as usize;
+        *self.list_state.offset_mut() = off;
+    }
+
+    fn move_catalog_cursor(&mut self, delta: isize) {
+        let len = self.catalog_entries.len();
+        if len == 0 {
+            self.set_catalog_cursor(0);
+            return;
+        }
+        let next = self.catalog_cursor as isize + delta;
+        self.set_catalog_cursor(next.clamp(0, len as isize - 1) as usize);
+    }
+
+    fn set_catalog_cursor(&mut self, index: usize) {
+        let len = self.catalog_entries.len();
+        if len == 0 {
+            self.catalog_cursor = 0;
+            self.catalog_list_state.select(None);
+            *self.catalog_list_state.offset_mut() = 0;
+            return;
+        }
+        self.catalog_cursor = index.min(len - 1);
+        self.catalog_list_state.select(Some(self.catalog_cursor));
+    }
+
+    fn max_catalog_offset(&self) -> usize {
+        self.catalog_entries
+            .len()
+            .saturating_sub(self.catalog_rows.max(1))
+    }
+
+    fn scroll_catalogs(&mut self, delta: isize) {
+        let len = self.catalog_entries.len();
+        if len == 0 {
+            self.set_catalog_cursor(0);
+            return;
+        }
+        let next = (self.catalog_cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.set_catalog_cursor(next);
+        *self.catalog_list_state.offset_mut() = next.min(self.max_catalog_offset());
+    }
+
+    fn nudge_catalogs(&mut self, delta: isize) {
+        self.move_catalog_cursor(delta);
+        let max_off = self.max_catalog_offset();
+        let off =
+            (self.catalog_list_state.offset() as isize + delta).clamp(0, max_off as isize) as usize;
+        *self.catalog_list_state.offset_mut() = off;
     }
 
     pub fn reload(&mut self) {
@@ -164,12 +252,7 @@ impl CatalogList {
         }
         catalog::preselect_installed(&mut self.selection, &self.observed, Some(&old));
         catalog::apply_facts(&mut self.packages, &self.facts);
-        let vis = self.visible().len();
-        self.cursor = if vis == 0 {
-            0
-        } else {
-            self.cursor.min(vis - 1)
-        };
+        self.set_pick_cursor(self.cursor);
     }
 
     pub fn toggle_show_all_installed(&mut self) {
@@ -183,12 +266,7 @@ impl CatalogList {
 
     pub fn refresh_catalog_entries(&mut self) -> Result<(), Error> {
         self.catalog_entries = catalog::all_entries(&self.config_dir).map_err(Error::Message)?;
-        let len = self.catalog_entries.len();
-        if len == 0 {
-            self.catalog_cursor = 0;
-        } else {
-            self.catalog_cursor = self.catalog_cursor.min(len - 1);
-        }
+        self.set_catalog_cursor(self.catalog_cursor);
         Ok(())
     }
 
@@ -205,16 +283,6 @@ impl CatalogList {
         }
         self.reload();
         let _ = self.persist_catalogs();
-    }
-
-    fn move_catalog_cursor(&mut self, delta: isize) {
-        let len = self.catalog_entries.len();
-        if len == 0 {
-            self.catalog_cursor = 0;
-            return;
-        }
-        let next = self.catalog_cursor as isize + delta;
-        self.catalog_cursor = next.clamp(0, len as isize - 1) as usize;
     }
 
     fn handle_catalog_key(&mut self, key: KeyEvent) -> CatalogsAction {
@@ -238,6 +306,23 @@ impl CatalogList {
                 self.move_catalog_cursor(-1);
                 CatalogsAction::Continue
             }
+            KeyCode::PageDown => {
+                self.scroll_catalogs(self.catalog_rows.max(1) as isize);
+                CatalogsAction::Continue
+            }
+            KeyCode::PageUp => {
+                self.scroll_catalogs(-(self.catalog_rows.max(1) as isize));
+                CatalogsAction::Continue
+            }
+            KeyCode::Home => {
+                self.scroll_catalogs(-(self.catalog_cursor as isize));
+                CatalogsAction::Continue
+            }
+            KeyCode::End => {
+                let last = self.catalog_entries.len().saturating_sub(1);
+                self.scroll_catalogs(last as isize - self.catalog_cursor as isize);
+                CatalogsAction::Continue
+            }
             _ => CatalogsAction::Continue,
         }
     }
@@ -248,16 +333,16 @@ impl CatalogList {
                 KeyCode::Esc => {
                     self.filtering = false;
                     self.filter.clear();
-                    self.cursor = 0;
+                    self.reset_pick_view();
                 }
                 KeyCode::Enter => self.filtering = false,
                 KeyCode::Backspace => {
                     self.filter.pop();
-                    self.cursor = 0;
+                    self.reset_pick_view();
                 }
                 KeyCode::Char(c) => {
                     self.filter.push(c);
-                    self.cursor = 0;
+                    self.reset_pick_view();
                 }
                 _ => {}
             }
@@ -297,9 +382,31 @@ impl CatalogList {
                 self.move_cursor(-1);
                 PickAction::Continue
             }
+            KeyCode::PageDown => {
+                self.scroll_pick(self.pick_rows.max(1) as isize);
+                PickAction::Continue
+            }
+            KeyCode::PageUp => {
+                self.scroll_pick(-(self.pick_rows.max(1) as isize));
+                PickAction::Continue
+            }
+            KeyCode::Home => {
+                self.scroll_pick(-(self.cursor as isize));
+                PickAction::Continue
+            }
+            KeyCode::End => {
+                let last = self.visible().len().saturating_sub(1);
+                self.scroll_pick(last as isize - self.cursor as isize);
+                PickAction::Continue
+            }
             KeyCode::Enter => PickAction::Confirm,
             _ => PickAction::Continue,
         }
+    }
+
+    fn reset_pick_view(&mut self) {
+        self.set_pick_cursor(0);
+        *self.list_state.offset_mut() = 0;
     }
 }
 
@@ -380,6 +487,10 @@ pub fn run(host: &impl Host, opts: Opts) -> Result<i32, Error> {
         filter: String::new(),
         filtering: false,
         show_all_installed: false,
+        list_state: ListState::default(),
+        catalog_list_state: ListState::default(),
+        pick_rows: 10,
+        catalog_rows: 10,
     };
     loop {
         let confirmed = pick(&mut list)?;
@@ -502,7 +613,9 @@ fn apply(
 
 fn pick(list: &mut CatalogList) -> Result<bool, Error> {
     let mut terminal = ratatui::init();
+    execute!(io::stdout(), EnableMouseCapture).map_err(Error::from)?;
     let result = pick_loop(&mut terminal, list);
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -517,53 +630,70 @@ fn pick_loop(terminal: &mut DefaultTerminal, list: &mut CatalogList) -> Result<b
                 Page::Confirm => draw_confirm(frame, list),
             })
             .map_err(|e| Error::Message(e.to_string()))?;
-        let Event::Key(key) = event::read().map_err(Error::from)? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        match page {
-            Page::Pick => match list.handle_key(key) {
-                PickAction::Continue => {}
-                PickAction::Catalogs => page = Page::Catalogs,
-                PickAction::Confirm => page = Page::Confirm,
-                PickAction::Abort => return Ok(false),
-            },
-            Page::Catalogs => match list.handle_catalog_key(key) {
-                CatalogsAction::Continue => {}
-                CatalogsAction::Done => {
-                    if let Err(err) = list.persist_catalogs() {
-                        eprintln!("{err}");
-                    }
-                    page = Page::Pick;
-                }
-                CatalogsAction::Create => {
-                    ratatui::restore();
-                    match run_catalog_create_interactive() {
-                        Ok(path) => {
-                            list.loaded.insert(CatalogId::Local(path));
-                            list.refresh_catalog_entries()?;
-                            list.reload();
-                            let _ = list.persist_catalogs();
+        match event::read().map_err(Error::from)? {
+            Event::Key(key) if actionable_key(&key) => match page {
+                Page::Pick => match list.handle_key(key) {
+                    PickAction::Continue => {}
+                    PickAction::Catalogs => page = Page::Catalogs,
+                    PickAction::Confirm => page = Page::Confirm,
+                    PickAction::Abort => return Ok(false),
+                },
+                Page::Catalogs => match list.handle_catalog_key(key) {
+                    CatalogsAction::Continue => {}
+                    CatalogsAction::Done => {
+                        if let Err(err) = list.persist_catalogs() {
+                            eprintln!("{err}");
                         }
-                        Err(err) => eprintln!("{err}"),
+                        page = Page::Pick;
                     }
-                    *terminal = ratatui::init();
-                }
-                CatalogsAction::Abort => return Ok(false),
+                    CatalogsAction::Create => {
+                        let _ = execute!(io::stdout(), DisableMouseCapture);
+                        ratatui::restore();
+                        match run_catalog_create_interactive() {
+                            Ok(path) => {
+                                list.loaded.insert(CatalogId::Local(path));
+                                list.refresh_catalog_entries()?;
+                                list.reload();
+                                let _ = list.persist_catalogs();
+                            }
+                            Err(err) => eprintln!("{err}"),
+                        }
+                        *terminal = ratatui::init();
+                        let _ = execute!(io::stdout(), EnableMouseCapture);
+                    }
+                    CatalogsAction::Abort => return Ok(false),
+                },
+                Page::Confirm => match key.code {
+                    KeyCode::Enter => return Ok(true),
+                    KeyCode::Esc => page = Page::Pick,
+                    KeyCode::Char('q') => return Ok(false),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(false);
+                    }
+                    _ => {}
+                },
             },
-            Page::Confirm => match key.code {
-                KeyCode::Enter => return Ok(true),
-                KeyCode::Esc => page = Page::Pick,
-                KeyCode::Char('q') => return Ok(false),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(false);
-                }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollDown => match page {
+                    Page::Pick => list.nudge_pick(1),
+                    Page::Catalogs => list.nudge_catalogs(1),
+                    Page::Confirm => {}
+                },
+                MouseEventKind::ScrollUp => match page {
+                    Page::Pick => list.nudge_pick(-1),
+                    Page::Catalogs => list.nudge_catalogs(-1),
+                    Page::Confirm => {}
+                },
                 _ => {}
             },
+            Event::Resize(_, _) => {}
+            _ => {}
         }
     }
+}
+
+fn actionable_key(key: &KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
 fn cell(s: &str, width: usize) -> String {
@@ -594,8 +724,9 @@ fn package_row_style(pkg: &Package, list: &CatalogList) -> Style {
     style
 }
 
-fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
+fn draw_pick(frame: &mut ratatui::Frame, list: &mut CatalogList) {
     let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
+    list.pick_rows = areas[0].height.saturating_sub(2).max(1) as usize;
     let inner = areas[0].width.saturating_sub(2) as usize;
     let desc_w = inner.saturating_sub(72);
     let visible = list.visible();
@@ -628,12 +759,12 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     let widget = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected(if visible.is_empty() {
+    list.list_state.select(if visible.is_empty() {
         None
     } else {
         Some(list.cursor)
     });
-    frame.render_stateful_widget(widget, areas[0], &mut state);
+    frame.render_stateful_widget(widget, areas[0], &mut list.list_state);
     frame.render_widget(
         Paragraph::new(
             "space toggle  a all  n none  o all installed  / filter  c catalogs  enter confirm  q abort",
@@ -642,8 +773,9 @@ fn draw_pick(frame: &mut ratatui::Frame, list: &CatalogList) {
     );
 }
 
-fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
+fn draw_catalogs(frame: &mut ratatui::Frame, list: &mut CatalogList) {
     let areas = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
+    list.catalog_rows = areas[0].height.saturating_sub(2).max(1) as usize;
     let inner = areas[0].width.saturating_sub(2) as usize;
     let desc_w = inner.saturating_sub(44);
     let items: Vec<ListItem> = list
@@ -668,13 +800,17 @@ fn draw_catalogs(frame: &mut ratatui::Frame, list: &CatalogList) {
     let widget = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("Catalogs"))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected(if list.catalog_entries.is_empty() {
-        None
-    } else {
-        Some(list.catalog_cursor)
-    });
-    frame.render_stateful_widget(widget, areas[0], &mut state);
-    frame.render_widget(Paragraph::new("space load/unload  n new  enter back"), areas[1]);
+    list.catalog_list_state
+        .select(if list.catalog_entries.is_empty() {
+            None
+        } else {
+            Some(list.catalog_cursor)
+        });
+    frame.render_stateful_widget(widget, areas[0], &mut list.catalog_list_state);
+    frame.render_widget(
+        Paragraph::new("space load/unload  n new  enter back"),
+        areas[1],
+    );
 }
 
 fn run_catalog_create_interactive() -> Result<PathBuf, Error> {
@@ -776,6 +912,10 @@ mod tests {
             filter: String::new(),
             filtering: false,
             show_all_installed: false,
+            list_state: ListState::default(),
+            catalog_list_state: ListState::default(),
+            pick_rows: 10,
+            catalog_rows: 10,
         }
     }
 
@@ -823,6 +963,10 @@ mod tests {
             filter: String::new(),
             filtering: false,
             show_all_installed: false,
+            list_state: ListState::default(),
+            catalog_list_state: ListState::default(),
+            pick_rows: 10,
+            catalog_rows: 10,
         }
     }
 
@@ -941,12 +1085,8 @@ mod tests {
         let host = ensure::FakeHost::default();
         let git = pkg("git");
         let rg = pkg("ripgrep");
-        host.installed
-            .borrow_mut()
-            .insert(git.id.clone());
-        host.installed
-            .borrow_mut()
-            .insert(rg.id.clone());
+        host.installed.borrow_mut().insert(git.id.clone());
+        host.installed.borrow_mut().insert(rg.id.clone());
         let packages = vec![git.clone(), rg.clone()];
         let mut selection = Selection::new();
         selection.insert(git.id.clone(), false);
@@ -962,12 +1102,8 @@ mod tests {
         let host = ensure::FakeHost::default();
         let git = pkg("git");
         let rg = pkg("ripgrep");
-        host.installed
-            .borrow_mut()
-            .insert(git.id.clone());
-        host.installed
-            .borrow_mut()
-            .insert(rg.id.clone());
+        host.installed.borrow_mut().insert(git.id.clone());
+        host.installed.borrow_mut().insert(rg.id.clone());
         let packages = vec![git, rg.clone()];
         let mut selection = Selection::new();
         selection.insert(packages[0].id.clone(), true);
@@ -992,13 +1128,22 @@ mod tests {
         let mut l = live_list();
         let unknown = PkgId::new(Kind::Formula, "macstrap-unknown-formula", None);
         l.observed.insert(unknown.clone());
-        assert!(!l.packages.iter().any(|p| p.name == "macstrap-unknown-formula"));
+        assert!(!l
+            .packages
+            .iter()
+            .any(|p| p.name == "macstrap-unknown-formula"));
         l.toggle_show_all_installed();
         assert!(l.show_all_installed);
-        assert!(l.packages.iter().any(|p| p.name == "macstrap-unknown-formula"));
+        assert!(l
+            .packages
+            .iter()
+            .any(|p| p.name == "macstrap-unknown-formula"));
         l.toggle_show_all_installed();
         assert!(!l.show_all_installed);
-        assert!(!l.packages.iter().any(|p| p.name == "macstrap-unknown-formula"));
+        assert!(!l
+            .packages
+            .iter()
+            .any(|p| p.name == "macstrap-unknown-formula"));
     }
 
     #[test]
@@ -1044,33 +1189,21 @@ mod tests {
         l.observed.insert(node.clone());
         l.reload();
         assert_eq!(
-            package_row_style(
-                l.packages.iter().find(|p| p.id == git).unwrap(),
-                &l,
-            )
-            .fg,
+            package_row_style(l.packages.iter().find(|p| p.id == git).unwrap(), &l,).fg,
             Some(Color::Green)
         );
         assert_eq!(
-            package_row_style(
-                l.packages.iter().find(|p| p.id == node).unwrap(),
-                &l,
-            )
-            .fg,
+            package_row_style(l.packages.iter().find(|p| p.id == node).unwrap(), &l,).fg,
             Some(Color::DarkGray)
         );
         assert_eq!(
-            package_row_style(
-                l.packages.iter().find(|p| p.name == "jq").unwrap(),
-                &l,
-            )
-            .fg,
+            package_row_style(l.packages.iter().find(|p| p.name == "jq").unwrap(), &l,).fg,
             None
         );
     }
 
-    fn long_pick_list(cursor: usize) -> CatalogList {
-        let packages: Vec<Package> = (0..30)
+    fn long_pick_list(n: usize, cursor: usize) -> CatalogList {
+        let packages: Vec<Package> = (0..n)
             .map(|i| {
                 let name = format!("tool-{i:02}");
                 Package {
@@ -1103,27 +1236,100 @@ mod tests {
             filter: String::new(),
             filtering: false,
             show_all_installed: false,
+            list_state: ListState::default(),
+            catalog_list_state: ListState::default(),
+            pick_rows: 10,
+            catalog_rows: 10,
         }
     }
 
-    #[test]
-    fn pick_list_scrolls_to_cursor() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let list = long_pick_list(25);
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_pick(frame, &list)).unwrap();
-        let text = terminal
+    fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        terminal
             .backend()
             .buffer()
             .content()
             .iter()
             .map(|c| c.symbol())
-            .collect::<String>();
+            .collect()
+    }
+
+    #[test]
+    fn pick_list_scrolls_to_cursor() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut list = long_pick_list(30, 25);
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_pick(frame, &mut list)).unwrap();
+        let text = buffer_text(&terminal);
         assert!(text.contains("tool-25"), "selected row should be visible");
-        assert!(!text.contains("tool-00"), "first row should scroll off screen");
+        assert!(
+            text.contains("tool-17"),
+            "viewport should show a page of rows"
+        );
+        assert!(
+            !text.contains("tool-00"),
+            "first row should scroll off screen"
+        );
+    }
+
+    #[test]
+    fn pick_list_page_down_scrolls_viewport() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut list = long_pick_list(80, 0);
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_pick(frame, &mut list)).unwrap();
+        list.scroll_pick(list.pick_rows as isize);
+        terminal.draw(|frame| draw_pick(frame, &mut list)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("tool-00"),
+            "page down should scroll the first row off a tall terminal"
+        );
+        assert!(text.contains(&format!("tool-{:02}", list.cursor)));
+    }
+
+    #[test]
+    fn page_keys_move_cursor() {
+        let mut l = long_pick_list(30, 0);
+        l.pick_rows = 10;
+        assert!(matches!(
+            l.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            PickAction::Continue
+        ));
+        assert_eq!(l.cursor, 10);
+        assert!(matches!(
+            l.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            PickAction::Continue
+        ));
+        assert_eq!(l.cursor, 29);
+        assert!(matches!(
+            l.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            PickAction::Continue
+        ));
+        assert_eq!(l.cursor, 0);
+        l.cursor = 15;
+        assert!(matches!(
+            l.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            PickAction::Continue
+        ));
+        assert_eq!(l.cursor, 5);
+    }
+
+    #[test]
+    fn repeat_and_release_keys() {
+        let press = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        let mut repeat = press;
+        repeat.kind = KeyEventKind::Repeat;
+        let mut release = press;
+        release.kind = KeyEventKind::Release;
+        assert!(actionable_key(&press));
+        assert!(actionable_key(&repeat));
+        assert!(!actionable_key(&release));
     }
 
     #[test]
